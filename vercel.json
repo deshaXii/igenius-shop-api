@@ -1,0 +1,10 @@
+{
+  "builds": [{ "src": "server.js", "use": "@vercel/node" }],
+  "routes": [{ "src": "/(.*)", "dest": "server.js" }],
+  "crons": [
+    {
+      "path": "/api/backup/run?secret=YOUR_CRON_SECRET",
+      "schedule": "59 20 * * *"
+    }
+  ]
+}
