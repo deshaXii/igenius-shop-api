@@ -18,7 +18,7 @@ app.use(cookieParser());
 // CORS — عدّل origin حسب بيئة التطوير والإنتاج
 const ALLOWED_ORIGINS = [
   "http://localhost:5173", // Vite dev
-  "https://mobile-repairs-shop.vercel.app",
+  "https://igenius-shop.vercel.app",
   "https://igenius-shop-api.vercel.app",
   process.env.FRONTEND_ORIGIN, // ضعها في .env للإنتاج
 ].filter(Boolean);
