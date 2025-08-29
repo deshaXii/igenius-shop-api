@@ -10,7 +10,14 @@ const jwt = require("jsonwebtoken");
  */
 module.exports = function attachRealtime(server, app) {
   const io = new Server(server, {
-    cors: { origin: "*", credentials: true },
+    cors: {
+      origin:
+        process.env.NODE_ENV === "development"
+          ? "http://localhost:5173"
+          : "https://igenius-shop.vercel.app",
+      credentials: true,
+    },
+    transports: ["polling", "websocket"],
     path: "/socket.io",
   });
 
