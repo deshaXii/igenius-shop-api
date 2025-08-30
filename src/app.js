@@ -31,7 +31,16 @@ app.use(
         ? cb(null, true)
         : cb(new Error("Not allowed by CORS"));
     },
-    credentials: true, // لو هتستخدم كوكيز JWT
+    credentials: true,
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Requested-With",
+      "Accept",
+    ],
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
   })
 );
 
