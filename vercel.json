@@ -1,6 +1,5 @@
 {
   "builds": [{ "src": "server.js", "use": "@vercel/node" }],
-  "routes": [{ "src": "/(.*)", "dest": "server.js" }],
   "headers": [
     {
       "source": "/api/(.*)",
@@ -18,7 +17,8 @@
           "value": "Content-Type, Authorization, X-Requested-With, Accept"
         },
         { "key": "Access-Control-Allow-Credentials", "value": "true" }
-      ]
+      ],
+      "dest": "server.js"
     }
   ]
 }
