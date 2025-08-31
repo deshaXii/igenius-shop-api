@@ -1,24 +1,4 @@
 {
   "builds": [{ "src": "server.js", "use": "@vercel/node" }],
-  "headers": [
-    {
-      "source": "/api/(.*)",
-      "headers": [
-        {
-          "key": "Access-Control-Allow-Origin",
-          "value": "https://igenius-shop.vercel.app"
-        },
-        {
-          "key": "Access-Control-Allow-Methods",
-          "value": "GET,OPTIONS,POST,PUT,PATCH,DELETE"
-        },
-        {
-          "key": "Access-Control-Allow-Headers",
-          "value": "Content-Type, Authorization, X-Requested-With, Accept"
-        },
-        { "key": "Access-Control-Allow-Credentials", "value": "true" }
-      ],
-      "dest": "server.js"
-    }
-  ]
+  "routes": [{ "src": "/(.*)", "dest": "server.js" }]
 }
