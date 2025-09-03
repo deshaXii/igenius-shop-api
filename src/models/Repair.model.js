@@ -1,4 +1,3 @@
-// src/models/Repair.model.js
 const mongoose = require("mongoose");
 
 const PartSchema = new mongoose.Schema(
@@ -41,29 +40,61 @@ const RepairSchema = new mongoose.Schema(
     color: { type: String, trim: true },
     phone: { type: String, trim: true },
     price: { type: Number, default: 0 },
+    finalPrice: { type: Number, default: 0 },
+
     technician: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     recipient: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+
     parts: { type: [PartSchema], default: [] },
+
     status: {
       type: String,
-      enum: [
-        "في الانتظار",
-        "جاري العمل",
-        "مكتمل",
-        "تم التسليم",
-        "مرفوض",
-        "مرتجع",
-      ],
+      enum: ["في الانتظار", "جاري العمل", "مكتمل", "تم التسليم", "مرفوض", "مرتجع"],
       default: "في الانتظار",
+    },
+
+    // --- Warranty fields ---
+    hasWarranty: { type: Boolean, default: false },
+    warrantyEnd: { type: Date, default: null },
+    warrantyNotes: { type: String, trim: true, default: "" },
+
+    // --- Customer updates for public tracking ---
+    customerUpdates: {
+      type: [
+        {
+          type: {
+            type: String,
+            enum: ["text", "image", "video", "audio"],
+            required: true,
+          },
+          text: { type: String, default: "" },
+          fileUrl: { type: String, default: "" },
+          createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+          createdAt: { type: Date, default: Date.now },
+          isPublic: { type: Boolean, default: true },
+        },
+      ],
+      default: [],
     },
 
     logs: [{ type: mongoose.Schema.Types.ObjectId, ref: "Log" }],
     notes: { type: String, trim: true },
 
+    // تتبّع عام
+    publicTracking: { type: PublicTrackingSchema, default: () => ({}) },
+
+    // أزمنة/تواريخ
     startTime: { type: Date },
-    finalPrice: { type: Number },
     endTime: { type: Date },
     deliveryDate: { type: Date },
+    eta: { type: Date }, // موعد تسليم متوقع
+
+    // معلومات المحل للعرض العام
+    shopName: { type: String, trim: true },
+    shopPhone: { type: String, trim: true },
+    shopWhatsapp: { type: String, trim: true },
+    shopAddress: { type: String, trim: true },
+    shopWorkingHours: { type: String, trim: true },
 
     returned: { type: Boolean, default: false },
     returnDate: { type: Date },
@@ -74,8 +105,6 @@ const RepairSchema = new mongoose.Schema(
       default: null,
     },
 
-    publicTracking: { type: PublicTrackingSchema, default: () => ({}) },
-    eta: { type: Date }, // موعد تسليم متوقع
     notesPublic: { type: String }, // ملاحظة قصيرة للعميل
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
@@ -86,7 +115,6 @@ const RepairSchema = new mongoose.Schema(
 
 RepairSchema.index({ createdAt: 1 });
 RepairSchema.index({ deliveryDate: 1 });
-
 RepairSchema.index(
   { "publicTracking.token": 1 },
   { unique: true, sparse: true }
@@ -109,13 +137,11 @@ async function dropOldPartsIdIndexIfExists() {
           console.log("[repairs] Dropped legacy index:", target.name);
         }
       } catch (e) {
-        // ما نوقفش السيرفر لو فشل — سجل فقط
         console.log("[repairs] Index drop check:", e.message);
       }
     };
 
     if (conn.readyState === 1) {
-      // connected بالفعل
       doDrop();
     } else {
       conn.once("open", doDrop);

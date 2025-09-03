@@ -1,4 +1,3 @@
-// src/api/repairs.routes.js
 const express = require("express");
 const router = express.Router();
 const Repair = require("../models/Repair.model");
@@ -17,7 +16,6 @@ const { sendWebPushToUsers } = require("./push.routes");
 // === Web Push (جديد) ===
 const webpush = require("web-push");
 const PushSub = require("../models/PushSub.model");
-// تهيئة VAPID مرّة واحدة (آمنة لو اتنادت أكتر من مرة)
 try {
   if (
     process.env.VAPID_PUBLIC_KEY &&
@@ -118,8 +116,8 @@ async function notifyUsers(req, userIds, message, type = "repair", meta = {}) {
     type === "repair" && meta?.repairNumber
       ? `تحديث صيانة #${meta.repairNumber}`
       : type === "repair"
-      ? "تحديث صيانة"
-      : "إشعار";
+        ? "تحديث صيانة"
+        : "إشعار";
 
   const payload = {
     title,
@@ -127,7 +125,6 @@ async function notifyUsers(req, userIds, message, type = "repair", meta = {}) {
     icon: "/icons/icon-192.png",
     badge: "/icons/icon-192.png",
     data: {
-      // افتح صفحة الصيانة لو متاحة، وإلا الهوم
       url: meta?.repairId ? `/repairs/${meta.repairId}` : "/",
       ...meta,
     },
@@ -156,7 +153,6 @@ async function nextRepairId() {
   return c.seq;
 }
 function baseUrl(req) {
-  // يشتغل محلي وعلى Vercel
   const host = req.get("x-forwarded-host") || req.get("host");
   const proto = (req.get("x-forwarded-proto") || req.protocol || "https")
     .split(",")[0]
@@ -164,7 +160,6 @@ function baseUrl(req) {
   return `${proto}://${host}`;
 }
 function generateTrackingToken(len = 12) {
-  // URL-safe
   return crypto
     .randomBytes(Math.ceil(len * 0.75))
     .toString("base64")
@@ -184,26 +179,6 @@ function publicPatchView(r) {
     notesPublic: r.notesPublic || null,
     finalPrice: typeof r.finalPrice === "number" ? r.finalPrice : null,
   };
-}
-function buildCreatedAtFilter(startDate, endDate) {
-  if (!startDate && !endDate) return null;
-  const createdAt = {};
-  if (startDate) {
-    if (/^\d{4}-\d{2}-\d{2}$/.test(startDate)) {
-      const s = new Date(startDate);
-      s.setHours(0, 0, 0, 0);
-      createdAt.$gte = s;
-    } else createdAt.$gte = new Date(startDate);
-  }
-  if (endDate) {
-    if (/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-      const e = new Date(endDate);
-      e.setHours(0, 0, 0, 0);
-      e.setDate(e.getDate() + 1);
-      createdAt.$lt = e;
-    } else createdAt.$lte = new Date(endDate);
-  }
-  return createdAt;
 }
 
 // ===== LIST =====
@@ -247,8 +222,7 @@ router.get("/", auth, async (req, res) => {
       }
 
       const dateOr = [];
-      if (Object.keys(createdCond).length)
-        dateOr.push({ createdAt: createdCond });
+      if (Object.keys(createdCond).length) dateOr.push({ createdAt: createdCond });
       if (Object.keys(deliveredCond).length)
         dateOr.push({ deliveryDate: deliveredCond });
 
@@ -364,14 +338,11 @@ router.post(
       );
 
       const trackingUrl = `${baseUrl(req)}/t/${token}`;
-
-      // نُرجع نفس الكائن + trackingUrl للاستخدام في المودال
       const plain = r.toObject();
       plain.publicTrackingUrl = trackingUrl;
 
       res.json(r);
     } catch (e) {
-      // معالجة واضحة لخطأ الفهرس القديم parts.id
       if (e?.code === 11000 && e?.keyPattern && e.keyPattern["parts.id"]) {
         return res.status(400).json({
           message:
@@ -384,7 +355,7 @@ router.post(
   }
 );
 
-// ====== normalize + UPDATE (كما هو مع تعديلاتك السابقة) ======
+// ====== ضبط الضمان ======
 function normalizeRejectedLocation(v) {
   if (v == null) return null;
   const s = String(v).trim();
@@ -412,12 +383,87 @@ function normalizeRejectedLocation(v) {
   return null;
 }
 
+router.post(
+  "/:id/warranty",
+  auth,
+  checkPermission("editRepair"),
+  async (req, res) => {
+    const { id } = req.params;
+    const { hasWarranty = true, warrantyEnd, warrantyNotes = "" } = req.body || {};
+    const repair = await Repair.findById(id);
+    if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
+    repair.hasWarranty = !!hasWarranty;
+    if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
+    repair.warrantyNotes = String(warrantyNotes || "");
+    await repair.save();
+    return res.json({
+      ok: true,
+      hasWarranty: repair.hasWarranty,
+      warrantyEnd: repair.warrantyEnd,
+      warrantyNotes: repair.warrantyNotes,
+    });
+  }
+);
+
+// Create a customer-facing update (text/image/video/audio)
+router.post(
+  "/:id/customer-updates",
+  auth,
+  checkPermission("editRepair"),
+  async (req, res) => {
+    const { id } = req.params;
+    const { type, text, fileUrl, isPublic = true } = req.body || {};
+    if (!["text", "image", "video", "audio"].includes(type)) {
+      return res.status(400).json({ message: "INVALID_TYPE" });
+    }
+    const repair = await Repair.findById(id);
+    if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
+
+    const update = {
+      type,
+      text: type === "text" ? String(text || "") : "",
+      fileUrl: type !== "text" ? String(fileUrl || "") : "",
+      createdBy: req.user?._id || undefined,
+      createdAt: new Date(),
+      isPublic: !!isPublic,
+    };
+    repair.customerUpdates = repair.customerUpdates || [];
+    repair.customerUpdates.push(update);
+    await repair.save();
+    return res.json({ ok: true, update });
+  }
+);
+
+// (متروك للتوافق إن كنت تستخدمه في مكان آخر)
+exports.setWarranty = async (req, res) => {
+  const { warrantyEnd, warrantyNotes } = req.body;
+  if (!warrantyEnd)
+    return res.status(400).json({ message: "warrantyEnd required" });
+  const repair = await Repair.findById(req.params.id);
+  if (!repair) return res.status(404).json({ message: "Not found" });
+
+  repair.hasWarranty = true;
+  repair.warrantyEnd = new Date(warrantyEnd);
+  if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
+  await repair.save();
+
+  req.io?.to(`repair:${repair._id}`).emit("repairs:changed", { id: repair._id });
+  return res.json({ ok: true });
+};
+
+// ===== UPDATE =====
 router.put("/:id", async (req, res) => {
   const repair = await Repair.findById(req.params.id);
   if (!repair) return res.status(404).json({ message: "Not found" });
 
   const body = req.body || {};
   const user = req.user;
+
+  // حقول الضمان (تُسمح مع من يملك صلاحية editRepair)
+  const { hasWarranty, warrantyEnd, warrantyNotes } = body;
+  if (typeof hasWarranty === "boolean") repair.hasWarranty = hasWarranty;
+  if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
+  if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
 
   const canEditAll =
     user.role === "admin" ||
@@ -488,7 +534,7 @@ router.put("/:id", async (req, res) => {
     assignIfDefined("deviceType");
     assignIfDefined("color");
     assignIfDefined("issue");
-    // assignIfDefined("price", (v) => Number(v) || 0);
+    // price: متروك كما كان
     if (
       typeof body.finalPrice !== "undefined" &&
       body.status !== "تم التسليم"
@@ -530,6 +576,9 @@ router.put("/:id", async (req, res) => {
     "price",
     "eta",
     "notesPublic",
+    "hasWarranty",
+    "warrantyEnd",
+    "warrantyNotes",
   ];
   const after = repair.toObject();
   const changes = diffChanges(before, after, fieldsToTrack);
@@ -541,6 +590,7 @@ router.put("/:id", async (req, res) => {
     changes,
   });
   await Repair.findByIdAndUpdate(repair._id, { $push: { logs: log._id } });
+
   // بثّ عام (لو التتبّع شغّال)
   const io = req.app.get("io");
   const token = repair.publicTracking?.enabled && repair.publicTracking?.token;
@@ -550,6 +600,7 @@ router.put("/:id", async (req, res) => {
       publicPatchView(repair)
     );
   }
+
   const admins = await getAdmins();
   const recipients = new Set(admins.map((a) => a._id.toString()));
   if (repair.technician) recipients.add(String(repair.technician));
@@ -601,7 +652,7 @@ router.delete(
   }
 );
 
-// ===== إدارة تتبّع عام (تفعيل/تعطيل/تجديد/خيارات العرض)
+// ===== إدارة تتبّع عام
 router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
   const { id } = req.params;
   const { enabled, regenerate, showPrice, showEta } = req.body || {};
@@ -610,8 +661,7 @@ router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
 
   if (!r.publicTracking) r.publicTracking = {};
   if (typeof enabled === "boolean") r.publicTracking.enabled = enabled;
-  if (typeof showPrice !== "undefined")
-    r.publicTracking.showPrice = !!showPrice;
+  if (typeof showPrice !== "undefined") r.publicTracking.showPrice = !!showPrice;
   if (typeof showEta !== "undefined") r.publicTracking.showEta = !!showEta;
 
   if (regenerate || !r.publicTracking.token) {

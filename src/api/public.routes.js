@@ -12,39 +12,34 @@ function toPublicView(doc) {
   const showEta = pt.showEta !== false;
 
   const timeline = [];
-  if (r.createdAt)
-    timeline.push({ key: "createdAt", label: "تم الاستلام", at: r.createdAt });
-  if (r.startTime)
-    timeline.push({
-      key: "startTime",
-      label: "بدأ الفني العمل",
-      at: r.startTime,
-    });
-  if (r.endTime)
-    timeline.push({ key: "endTime", label: "اكتملت الصيانة", at: r.endTime });
-  if (r.deliveryDate)
-    timeline.push({
-      key: "deliveryDate",
-      label: "تم التسليم",
-      at: r.deliveryDate,
-    });
+  if (r.createdAt) timeline.push({ key: "createdAt", label: "تم الاستلام", at: r.createdAt });
+  if (r.startTime) timeline.push({ key: "start", label: "بدأ العمل", at: r.startTime });
+  if (r.endTime) timeline.push({ key: "end", label: "اكتملت", at: r.endTime });
+  if (r.deliveryDate) timeline.push({ key: "delivered", label: "تم التسليم", at: r.deliveryDate });
 
   return {
+    id: r._id,
     repairId: r.repairId,
+    customerName: r.customerName,
     deviceType: r.deviceType,
+    color: r.color,
     status: r.status,
-    createdAt: r.createdAt,
-    startTime: r.startTime || null,
-    endTime: r.endTime || null,
-    deliveryDate: r.deliveryDate || null,
-    eta: showEta ? r.eta || null : null,
-    notesPublic: r.notesPublic || null,
-    finalPrice: showPrice
-      ? typeof r.finalPrice === "number"
-        ? r.finalPrice
-        : null
-      : null,
     timeline,
+    price: showPrice ? r.price : undefined,
+    eta: showEta ? r.eta : undefined,
+    notesPublic: r.notesPublic,
+    publicTracking: r.publicTracking,
+    hasWarranty: r.hasWarranty,
+    warrantyEnd: r.warrantyEnd,
+    warrantyNotes: r.warrantyNotes,
+    updates: (r.customerUpdates || [])
+      .filter((u) => u.isPublic)
+      .map((u) => ({
+        type: u.type,
+        text: u.text,
+        fileUrl: u.fileUrl,
+        createdAt: u.createdAt,
+      })),
   };
 }
 
@@ -65,28 +60,15 @@ router.get("/repairs/:token", async (req, res) => {
     { new: true }
   )
     .select("-logs -notes")
-    .select(
-      "repairId deviceType status createdAt startTime endTime deliveryDate eta notesPublic finalPrice publicTracking"
-    )
+    // .select(
+    //   "repairId deviceType status createdAt startTime endTime deliveryDate eta notesPublic finalPrice publicTracking"
+    // )
     .lean();
 
   if (!r) return res.status(404).json({ message: "NOT_FOUND" });
 
   return res.json({
-    repair: {
-      _id: r._id,
-      repairId: r.repairId,
-      deviceType: r.deviceType,
-      status: r.status,
-      createdAt: r.createdAt,
-      startTime: r.startTime,
-      endTime: r.endTime,
-      deliveryDate: r.deliveryDate,
-      finalPrice: r.finalPrice,
-      eta: r.eta,
-      notesPublic: r.notesPublic,
-      publicTracking: r.publicTracking, // فيه views & lastViewedAt
-    },
+    repair: toPublicView(r),
     shop: {
       name: r.shopName,
       phone: r.shopPhone,
