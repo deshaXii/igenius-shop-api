@@ -12,7 +12,8 @@ const { requireAny, isAdmin, hasPerm } = require("../middleware/perm");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
 const { sendWebPushToUsers } = require("./push.routes");
-
+const { fromZonedTime } = require("date-fns-tz");
+const APP_TZ = process.env.APP_TZ || "Africa/Cairo";
 // === Web Push (جديد) ===
 const webpush = require("web-push");
 const PushSub = require("../models/PushSub.model");
@@ -88,7 +89,7 @@ async function getAdmins() {
     .lean();
 }
 
-// بث + حفظ إشعار
+// بث  حفظ إشعار
 async function notifyUsers(req, userIds, message, type = "repair", meta = {}) {
   if (!Array.isArray(userIds) || userIds.length === 0) return;
 
@@ -116,8 +117,8 @@ async function notifyUsers(req, userIds, message, type = "repair", meta = {}) {
     type === "repair" && meta?.repairNumber
       ? `تحديث صيانة #${meta.repairNumber}`
       : type === "repair"
-        ? "تحديث صيانة"
-        : "إشعار";
+      ? "تحديث صيانة"
+      : "إشعار";
 
   const payload = {
     title,
@@ -163,7 +164,7 @@ function generateTrackingToken(len = 12) {
   return crypto
     .randomBytes(Math.ceil(len * 0.75))
     .toString("base64")
-    .replace(/[+/=]/g, "")
+    .replace(/[/=]/g, "")
     .slice(0, len);
 }
 // عرض آمن مختصر للتحديث العام (للبث)
@@ -192,7 +193,7 @@ router.get("/", auth, async (req, res) => {
       const rx = new RegExp(
         String(q)
           .trim()
-          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+          .replace(/[.*?^${}()|[\]\\]/g, "\\$&"),
         "i"
       );
       filter.$or = [
@@ -207,9 +208,10 @@ router.get("/", auth, async (req, res) => {
     if (technician) filter.technician = technician;
 
     if (startDate || endDate) {
-      const start = startDate ? new Date(`${startDate}T00:00:00`) : null;
-      const end = endDate ? new Date(`${endDate}T23:59:59.999`) : null;
-
+      const toUtcStart = (s) => fromZonedTime(`${s} 00:00:00`, APP_TZ);
+      const toUtcEnd = (s) => fromZonedTime(`${s} 23:59:59.999`, APP_TZ);
+      const start = startDate ? toUtcStart(startDate) : null;
+      const end = endDate ? toUtcEnd(endDate) : null;
       const createdCond = {};
       const deliveredCond = {};
       if (start) {
@@ -222,7 +224,8 @@ router.get("/", auth, async (req, res) => {
       }
 
       const dateOr = [];
-      if (Object.keys(createdCond).length) dateOr.push({ createdAt: createdCond });
+      if (Object.keys(createdCond).length)
+        dateOr.push({ createdAt: createdCond });
       if (Object.keys(deliveredCond).length)
         dateOr.push({ deliveryDate: deliveredCond });
 
@@ -361,7 +364,7 @@ function normalizeRejectedLocation(v) {
   const s = String(v).trim();
 
   const t = s
-    .replace(/\s+/g, " ")
+    .replace(/\s/g, " ")
     .replace(/[اأإآ]/g, "ا")
     .replace(/ى/g, "ي")
     .replace(/ة/g, "ه")
@@ -389,7 +392,11 @@ router.post(
   checkPermission("editRepair"),
   async (req, res) => {
     const { id } = req.params;
-    const { hasWarranty = true, warrantyEnd, warrantyNotes = "" } = req.body || {};
+    const {
+      hasWarranty = true,
+      warrantyEnd,
+      warrantyNotes = "",
+    } = req.body || {};
     const repair = await Repair.findById(id);
     if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
     repair.hasWarranty = !!hasWarranty;
@@ -447,7 +454,9 @@ exports.setWarranty = async (req, res) => {
   if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
   await repair.save();
 
-  req.io?.to(`repair:${repair._id}`).emit("repairs:changed", { id: repair._id });
+  req.io
+    ?.to(`repair:${repair._id}`)
+    .emit("repairs:changed", { id: repair._id });
   return res.json({ ok: true });
 };
 
@@ -661,7 +670,8 @@ router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
 
   if (!r.publicTracking) r.publicTracking = {};
   if (typeof enabled === "boolean") r.publicTracking.enabled = enabled;
-  if (typeof showPrice !== "undefined") r.publicTracking.showPrice = !!showPrice;
+  if (typeof showPrice !== "undefined")
+    r.publicTracking.showPrice = !!showPrice;
   if (typeof showEta !== "undefined") r.publicTracking.showEta = !!showEta;
 
   if (regenerate || !r.publicTracking.token) {
@@ -688,7 +698,7 @@ router.get("/:id/public-qr.svg", requireAny(isAdmin), async (req, res) => {
     .lean();
   if (!r || !r.publicTracking?.token) return res.status(404).end();
   const url = `${baseUrl(req)}/t/${r.publicTracking.token}`;
-  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Content-Type", "image/svgxml");
   const svg = await QRCode.toString(url, {
     type: "svg",
     margin: 1,

@@ -41,11 +41,9 @@ router.post("/login", async (req, res) => {
 
     const id = String(identifier || email || username || phone || "").trim();
     if (!id || !password) {
-      return res
-        .status(400)
-        .json({
-          message: "identifier/email/username/phone and password are required",
-        });
+      return res.status(400).json({
+        message: "identifier/email/username/phone and password are required",
+      });
     }
 
     const query = {
