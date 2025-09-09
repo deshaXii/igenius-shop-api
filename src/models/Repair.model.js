@@ -1,5 +1,35 @@
 const mongoose = require("mongoose");
 
+/* ===== Flow per department ===== */
+const RepairFlowSchema = new mongoose.Schema(
+  {
+    department: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Department",
+      required: true,
+      index: true,
+    },
+    // مهم: الفني هو User
+    technician: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    status: {
+      type: String,
+      enum: ["waiting", "in_progress", "completed"],
+      default: "waiting",
+      index: true,
+    },
+    price: { type: Number, default: 0 }, // تسعير القسم على الصيانة
+    notes: { type: String, default: "" },
+    startedAt: { type: Date, default: null },
+    completedAt: { type: Date, default: null },
+  },
+  { _id: true, timestamps: true }
+);
+
+/* ===== Parts ===== */
 const PartSchema = new mongoose.Schema(
   {
     id: { type: Number },
@@ -16,6 +46,7 @@ const PartSchema = new mongoose.Schema(
   { _id: true }
 );
 
+/* ===== Public tracking ===== */
 const PublicTrackingSchema = new mongoose.Schema(
   {
     enabled: { type: Boolean, default: true },
@@ -26,19 +57,46 @@ const PublicTrackingSchema = new mongoose.Schema(
     lastViewedAt: Date,
     views: { type: Number, default: 0 },
     expiresAt: Date,
-    passcodeHash: String, // لو فعلت PIN مستقبلاً
+    passcodeHash: String,
   },
   { _id: false }
 );
 
+/* ===== Embedded events for timeline (distinct from external Log model) ===== */
+const RepairEventSchema = new mongoose.Schema(
+  {
+    type: {
+      type: String,
+      enum: [
+        "create",
+        "assign_department",
+        "assign_technician",
+        "flow_start",
+        "flow_complete",
+        "move_next",
+        "status_change",
+        "price_set",
+      ],
+      required: true,
+    },
+    by: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+    at: { type: Date, default: Date.now },
+    payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+  },
+  { _id: false }
+);
+
+/* ===== Repair ===== */
 const RepairSchema = new mongoose.Schema(
   {
     repairId: { type: Number, unique: true, index: true },
+
     customerName: { type: String, required: true, trim: true },
     deviceType: { type: String, required: true, trim: true },
     issue: { type: String, trim: true },
     color: { type: String, trim: true },
     phone: { type: String, trim: true },
+
     price: { type: Number, default: 0 },
     finalPrice: { type: Number, default: 0 },
 
@@ -47,18 +105,42 @@ const RepairSchema = new mongoose.Schema(
 
     parts: { type: [PartSchema], default: [] },
 
+    // القسم الحالي (ونبقي على department للتوافق)
+    currentDepartment: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Department",
+      index: true,
+      default: null,
+    },
+    department: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Department",
+      index: true,
+      default: null,
+    },
+
+    // مسار الأقسام
+    flows: { type: [RepairFlowSchema], default: [] },
+
     status: {
       type: String,
-      enum: ["في الانتظار", "جاري العمل", "مكتمل", "تم التسليم", "مرفوض", "مرتجع"],
+      enum: [
+        "في الانتظار",
+        "جاري العمل",
+        "مكتمل",
+        "تم التسليم",
+        "مرفوض",
+        "مرتجع",
+      ],
       default: "في الانتظار",
     },
 
-    // --- Warranty fields ---
+    // Warranty
     hasWarranty: { type: Boolean, default: false },
     warrantyEnd: { type: Date, default: null },
     warrantyNotes: { type: String, trim: true, default: "" },
 
-    // --- Customer updates for public tracking ---
+    // Updates for public tracking
     customerUpdates: {
       type: [
         {
@@ -77,19 +159,20 @@ const RepairSchema = new mongoose.Schema(
       default: [],
     },
 
-    logs: [{ type: mongoose.Schema.Types.ObjectId, ref: "Log" }],
+    // أحداث داخلية للتايملاين (embed)
+    events: { type: [RepairEventSchema], default: [] },
+
     notes: { type: String, trim: true },
 
-    // تتبّع عام
     publicTracking: { type: PublicTrackingSchema, default: () => ({}) },
 
-    // أزمنة/تواريخ
+    // Times
     startTime: { type: Date },
     endTime: { type: Date },
     deliveryDate: { type: Date },
-    eta: { type: Date }, // موعد تسليم متوقع
+    eta: { type: Date },
 
-    // معلومات المحل للعرض العام
+    // Shop info
     shopName: { type: String, trim: true },
     shopPhone: { type: String, trim: true },
     shopWhatsapp: { type: String, trim: true },
@@ -105,14 +188,42 @@ const RepairSchema = new mongoose.Schema(
       default: null,
     },
 
-    notesPublic: { type: String }, // ملاحظة قصيرة للعميل
+    notesPublic: { type: String },
+
+    startedAt: { type: Date, default: null },
+    completedAt: { type: Date, default: null },
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
   },
-  { timestamps: true }
+  { _id: true, timestamps: true }
 );
 
+// إضافة الحقول الجديدة
+RepairSchema.add({
+  currentDepartment: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Department",
+    index: true,
+    default: null,
+  },
+  department: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Department",
+    index: true,
+    default: null,
+  },
+  flows: { type: [RepairFlowSchema], default: [] },
+  logs: { type: [mongoose.Schema.Types.Mixed], default: [] },
+});
+
+/* ===== Virtuals / Indexes ===== */
+RepairSchema.virtual("departmentPriceTotal").get(function () {
+  return (this.flows || []).reduce((s, f) => s + (Number(f.price) || 0), 0);
+});
+
+RepairSchema.index({ currentDepartment: 1, updatedAt: -1 });
+RepairSchema.index({ "flows.department": 1, "flows.status": 1 });
 RepairSchema.index({ createdAt: 1 });
 RepairSchema.index({ deliveryDate: 1 });
 RepairSchema.index(
@@ -120,6 +231,24 @@ RepairSchema.index(
   { unique: true, sparse: true }
 );
 
+/* ===== Derive department from technician if missing ===== */
+RepairSchema.pre("save", async function (next) {
+  try {
+    if (!this.department && this.technician) {
+      const User = require("./User.model");
+      const t = await User.findById(this.technician).select("department");
+      if (t && t.department) {
+        this.department = t.department;
+        this.currentDepartment = t.department;
+      }
+    }
+    next();
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ===== One-off: drop legacy parts.id index if exists ===== */
 async function dropOldPartsIdIndexIfExists() {
   try {
     const conn = mongoose.connection;

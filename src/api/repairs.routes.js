@@ -1,11 +1,13 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
+
 const Repair = require("../models/Repair.model");
 const User = require("../models/User.model");
-const Log = require("../models/Log.model");
 const Counter = require("../models/Counter.model");
 const Notification = require("../models/Notification.model");
-const Settings = require("../models/Settings.model");
+// const Settings = require("../models/Settings.model"); // لو محتاجه فعلاً فعّل السطر
+
 const auth = require("../middleware/auth");
 const checkPermission = require("../middleware/checkPermission");
 const { requireAny, isAdmin, hasPerm } = require("../middleware/perm");
@@ -14,9 +16,11 @@ const QRCode = require("qrcode");
 const { sendWebPushToUsers } = require("./push.routes");
 const { fromZonedTime } = require("date-fns-tz");
 const APP_TZ = process.env.APP_TZ || "Africa/Cairo";
-// === Web Push (جديد) ===
+const requireAuth = require("../middleware/requireAuth");
+const Department = require("../models/Department.model");
+
+// ===== Web Push =====
 const webpush = require("web-push");
-const PushSub = require("../models/PushSub.model");
 try {
   if (
     process.env.VAPID_PUBLIC_KEY &&
@@ -37,9 +41,106 @@ try {
   console.error("[web-push] init error:", e);
 }
 
-router.use(auth);
+router.use(requireAuth);
 
-// ===== Helpers =====
+/* ===== Logs helpers (embedded) ===== */
+function pushLog(doc, type, by, payload = {}) {
+  try {
+    doc.logs = Array.isArray(doc.logs) ? doc.logs : [];
+    doc.logs.push({
+      type,
+      by: by ? String(by) : undefined,
+      at: new Date(),
+      payload,
+      _v: "embedded",
+    });
+  } catch (e) {
+    console.log("[logs] push error:", e?.message);
+  }
+}
+function normalizeLogsForRead(logs = [], limit = 200) {
+  const arr = Array.isArray(logs) ? logs : [];
+  const onlyEmbedded = arr.filter((x) => x && typeof x === "object" && x.type);
+  onlyEmbedded.sort((a, b) => new Date(b.at || 0) - new Date(a.at || 0));
+  return onlyEmbedded.slice(0, limit);
+}
+
+/* ===== Helpers ===== */
+async function isMonitorOf(userId, deptId) {
+  const d = await Department.findById(deptId).select("monitor");
+  return !!(d && d.monitor && String(d.monitor) === String(userId));
+}
+function currentFlow(repair) {
+  if (!repair.flows || repair.flows.length === 0) return null;
+  const i = [...repair.flows]
+    .reverse()
+    .findIndex((f) => f.status !== "completed");
+  const idx = i === -1 ? repair.flows.length - 1 : repair.flows.length - 1 - i;
+  return { flow: repair.flows[idx], idx };
+}
+function canViewAll(user) {
+  return (
+    user?.role === "admin" ||
+    user?.permissions?.adminOverride ||
+    user?.permissions?.addRepair ||
+    user?.permissions?.receiveDevice
+  );
+}
+function hasEditAll(user) {
+  return (
+    user?.role === "admin" ||
+    user?.permissions?.adminOverride ||
+    user?.permissions?.editRepair
+  );
+}
+function isAssignedTech(flow, userId) {
+  return flow?.technician && String(flow.technician) === String(userId);
+}
+function deny(msg = "Forbidden", code = 403) {
+  const err = new Error(msg);
+  err.status = code;
+  return err;
+}
+
+/** إذن إدارة الخطوة الحالية حسب نوع الإجراء */
+async function assertCanManageStep(req, repair, flow, action, payload = {}) {
+  const cur = currentFlow(repair);
+  if (!cur || String(cur.flow._id) !== String(flow._id))
+    throw deny("هذه ليست الخطوة الحالية", 403);
+
+  const editor = hasEditAll(req.user);
+  const monitor = await isMonitorOf(req.user._id, flow.department);
+  const assigned = isAssignedTech(flow, req.user._id);
+  const sameDept =
+    String(req.user?.department || "") === String(flow.department || "");
+
+  if (action === "assign_technician") {
+    const selfAssign =
+      payload?.technicianId &&
+      String(payload.technicianId) === String(req.user._id);
+    if (editor || monitor || (selfAssign && sameDept)) return true;
+    throw deny(
+      "غير مسموح بتعيين فنّي. يُسمح للمراقب/الأدمن أو للفنّي نفسه من نفس القسم.",
+      403
+    );
+  }
+
+  if (action === "complete_step") {
+    if (editor || monitor || assigned) return true;
+    throw deny(
+      "غير مسموح بتعليم الخطوة كمكتملة إلا للأدمن/المراقب أو الفنّي المعيَّن.",
+      403
+    );
+  }
+
+  if (action === "move_next") {
+    if (editor || monitor || assigned) return true;
+    throw deny("غير مسموح بنقل الصيانة للخطوة التالية.", 403);
+  }
+
+  if (editor || monitor) return true;
+  throw deny();
+}
 
 function _label(field) {
   const map = {
@@ -72,15 +173,6 @@ function summarizeChanges(changes = []) {
     }))
     .slice(0, 5);
 }
-
-function canViewAll(user) {
-  return (
-    user?.role === "admin" ||
-    user?.permissions?.adminOverride ||
-    user?.permissions?.addRepair ||
-    user?.permissions?.receiveDevice
-  );
-}
 async function getAdmins() {
   return User.find({
     $or: [{ role: "admin" }, { "permissions.adminOverride": true }],
@@ -88,17 +180,11 @@ async function getAdmins() {
     .select("_id")
     .lean();
 }
-
-// بث  حفظ إشعار
 async function notifyUsers(req, userIds, message, type = "repair", meta = {}) {
   if (!Array.isArray(userIds) || userIds.length === 0) return;
-
-  // 1) احفظ الإشعار في DB
   const docs = await Notification.insertMany(
     userIds.map((u) => ({ user: u, message, type, meta }))
   );
-
-  // 2) Socket.io بث فوري
   const io = req.app.get("io");
   if (io) {
     for (const n of docs) {
@@ -111,30 +197,30 @@ async function notifyUsers(req, userIds, message, type = "repair", meta = {}) {
       });
     }
   }
-
-  // 3) Web Push إرسال
   const title =
     type === "repair" && meta?.repairNumber
       ? `تحديث صيانة #${meta.repairNumber}`
       : type === "repair"
       ? "تحديث صيانة"
       : "إشعار";
-
   const payload = {
     title,
     body: message || "",
     icon: "/icons/icon-192.png",
     badge: "/icons/icon-192.png",
-    data: {
-      url: meta?.repairId ? `/repairs/${meta.repairId}` : "/",
-      ...meta,
-    },
+    data: { url: meta?.repairId ? `/repairs/${meta.repairId}` : "/", ...meta },
     vibrate: [100, 50, 100],
   };
-
-  await sendWebPushToUsers(userIds, payload);
+  try {
+    setImmediate(() => {
+      sendWebPushToUsers(userIds, payload).catch((err) =>
+        console.log("[web-push] send error:", err?.message)
+      );
+    });
+  } catch (e) {
+    console.log("[web-push] skipped:", e?.message);
+  }
 }
-
 function diffChanges(oldDoc, newDoc, fields) {
   const changes = [];
   fields.forEach((f) => {
@@ -167,7 +253,6 @@ function generateTrackingToken(len = 12) {
     .replace(/[/=]/g, "")
     .slice(0, len);
 }
-// عرض آمن مختصر للتحديث العام (للبث)
 function publicPatchView(r) {
   return {
     repairId: r.repairId,
@@ -182,11 +267,10 @@ function publicPatchView(r) {
   };
 }
 
-// ===== LIST =====
+/* ===== LIST ===== */
 router.get("/", auth, async (req, res) => {
   try {
     const { q, status, technician, startDate, endDate } = req.query;
-
     const filter = {};
 
     if (q) {
@@ -222,13 +306,11 @@ router.get("/", auth, async (req, res) => {
         createdCond.$lte = end;
         deliveredCond.$lte = end;
       }
-
       const dateOr = [];
       if (Object.keys(createdCond).length)
         dateOr.push({ createdAt: createdCond });
       if (Object.keys(deliveredCond).length)
         dateOr.push({ deliveryDate: deliveredCond });
-
       if (dateOr.length) {
         if (filter.$or) {
           filter.$and = [{ $or: filter.$or }, { $or: dateOr }];
@@ -239,15 +321,7 @@ router.get("/", auth, async (req, res) => {
       }
     }
 
-    const canViewAllFlag =
-      req.user.role === "admin" ||
-      req.user.permissions?.adminOverride ||
-      req.user.permissions?.addRepair ||
-      req.user.permissions?.receiveDevice;
-
-    if (!canViewAllFlag) {
-      filter.technician = req.user.id;
-    }
+    if (!canViewAll(req.user)) filter.technician = req.user.id;
 
     const list = await Repair.find(filter)
       .sort({ createdAt: -1 })
@@ -263,17 +337,12 @@ router.get("/", auth, async (req, res) => {
   }
 });
 
-// ===== GET one =====
+/* ===== GET one ===== */
 router.get("/:id", async (req, res) => {
   const r = await Repair.findById(req.params.id)
     .populate("technician", "name")
     .populate("recipient", "name")
     .populate("createdBy", "name")
-    .populate({
-      path: "logs",
-      options: { sort: { createdAt: -1 } },
-      populate: { path: "changedBy", select: "name" },
-    })
     .lean();
   if (!r) return res.status(404).json({ message: "Not found" });
 
@@ -288,10 +357,11 @@ router.get("/:id", async (req, res) => {
     }
   }
 
+  r.logs = normalizeLogsForRead(r.logs, 200);
   res.json(r);
 });
 
-// ===== CREATE =====
+/* ===== CREATE ===== */
 router.post(
   "/",
   auth,
@@ -299,10 +369,14 @@ router.post(
   async (req, res) => {
     try {
       const payload = req.body || {};
+      const initialDepartment =
+        payload.initialDepartment || payload.department || null;
+      const initialTechnician = payload.technician || null;
+
       payload.repairId = await nextRepairId();
       payload.createdBy = req.user.id;
 
-      // خلق توكن تتبّع
+      // tracking token
       const token = generateTrackingToken();
       payload.publicTracking = {
         enabled: true,
@@ -311,45 +385,54 @@ router.post(
         showEta: true,
       };
 
-      const r = new Repair(payload);
-      await r.save();
-
-      const log = await Log.create({
-        repair: r._id,
-        action: "create",
-        changedBy: req.user.id,
-        details: "إنشاء صيانة جديدة",
+      const r = new Repair({
+        ...payload,
+        currentDepartment: initialDepartment || null,
+        department: initialDepartment || null,
+        flows: initialDepartment
+          ? [
+              {
+                department: initialDepartment,
+                technician: initialTechnician || null,
+                status: initialTechnician ? "in_progress" : "waiting",
+                startedAt: initialTechnician ? new Date() : null,
+              },
+            ]
+          : [],
+        logs: [],
       });
-      await Repair.findByIdAndUpdate(r._id, { $push: { logs: log._id } });
+
+      // log: create
+      pushLog(r, "create", req.user?._id || req.user?.id, {
+        initialDepartment,
+        initialTechnician,
+      });
+
+      await r.save();
 
       const admins = await getAdmins();
       const recipients = [];
       if (r.technician) recipients.push(r.technician.toString());
       recipients.push(...admins.map((a) => a._id.toString()));
-      await notifyUsers(
+      notifyUsers(
         req,
         recipients,
         `تم إضافة صيانة جديدة #${r.repairId}`,
         "repair",
         {
           repairId: r._id,
-          logId: log._id,
           deviceType: r.deviceType,
           repairNumber: r.repairId,
           changes: [],
         }
       );
 
-      const trackingUrl = `${baseUrl(req)}/t/${token}`;
-      const plain = r.toObject();
-      plain.publicTrackingUrl = trackingUrl;
-
       res.json(r);
     } catch (e) {
       if (e?.code === 11000 && e?.keyPattern && e.keyPattern["parts.id"]) {
         return res.status(400).json({
           message:
-            "فهرس قديم على parts.id يسبب تعارض. تم إزالة الاعتماد عليه في الكود. لو استمر الخطأ، أسقط الفهرس parts.id_1 من مجموعة repairs ثم أعد المحاولة.",
+            "فهرس قديم على parts.id يسبب تعارض. لو استمر الخطأ، أسقط الفهرس parts.id_1 من مجموعة repairs ثم أعد المحاولة.",
         });
       }
       console.error("create repair error:", e);
@@ -358,7 +441,183 @@ router.post(
   }
 );
 
-// ====== ضبط الضمان ======
+/* ===== TIMELINE + ACL ===== */
+router.get("/:id/timeline", async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(id))
+      return res.status(400).json({ error: "InvalidId" });
+
+    const r = await Repair.findById(id)
+      .populate("flows.department", "name")
+      .populate("flows.technician", "name username email")
+      .populate("currentDepartment", "name")
+      .lean();
+
+    if (!r) return res.status(404).json({ error: "NotFound" });
+
+    const flows = Array.isArray(r.flows) ? r.flows : [];
+    const total = flows.reduce((s, f) => s + (Number(f.price) || 0), 0);
+
+    const cur = flows.length ? flows[flows.length - 1] : null;
+    const monitor = cur
+      ? await isMonitorOf(req.user._id, cur.department)
+      : false;
+    const assigned = cur
+      ? String(cur.technician?._id || cur.technician || "") ===
+        String(req.user._id)
+      : false;
+    const editor = hasEditAll(req.user);
+    const sameDept = cur
+      ? String(req.user?.department || "") === String(cur.department || "")
+      : false;
+
+    const acl = {
+      canAssignTech: !!(
+        editor ||
+        monitor ||
+        (sameDept && cur && cur.status !== "completed")
+      ),
+      canCompleteCurrent: !!(editor || monitor || assigned),
+      canMoveNext: !!(
+        editor ||
+        monitor ||
+        (assigned && cur && cur.status === "completed")
+      ),
+    };
+
+    return res.json({
+      currentDepartment: r.currentDepartment || null,
+      flows,
+      logs: normalizeLogsForRead(r.logs, 200),
+      departmentPriceTotal: total,
+      acl,
+    });
+  } catch (e) {
+    console.error("timeline error:", e);
+    return res.status(500).json({ error: "TimelineFailed" });
+  }
+});
+
+/* ===== Assign technician ===== */
+router.put("/:id/assign-tech", async (req, res, next) => {
+  try {
+    const { flowId, technicianId } = req.body;
+    const r = await Repair.findById(req.params.id);
+    if (!r) return res.status(404).json({ error: "NotFound" });
+
+    const { flow } = flowId ? { flow: r.flows.id(flowId) } : currentFlow(r);
+    if (!flow) return res.status(400).json({ error: "NoActiveFlow" });
+
+    await assertCanManageStep(req, r, flow, "assign_technician", {
+      technicianId,
+    });
+
+    flow.technician = technicianId || null;
+    if (flow.status === "waiting" && technicianId) {
+      flow.status = "in_progress";
+      flow.startedAt = new Date();
+    }
+
+    pushLog(r, "assign_technician", req.user?._id || req.user?.id, {
+      flowId: flow._id,
+      technicianId,
+    });
+
+    await r.save();
+
+    const out = await Repair.findById(r._id)
+      .select("flows currentDepartment")
+      .populate("flows.department", "name")
+      .populate("flows.technician", "name username email")
+      .lean();
+    res.json(out);
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ===== Complete step ===== */
+router.put("/:id/complete-step", async (req, res, next) => {
+  try {
+    const { flowId, price, notes } = req.body;
+    const r = await Repair.findById(req.params.id);
+    if (!r) return res.status(404).json({ error: "NotFound" });
+
+    const { flow } = flowId ? { flow: r.flows.id(flowId) } : currentFlow(r);
+    if (!flow) return res.status(400).json({ error: "NoActiveFlow" });
+
+    await assertCanManageStep(req, r, flow, "complete_step");
+
+    flow.status = "completed";
+    flow.completedAt = new Date();
+    if (price != null) flow.price = Number(price) || 0;
+    if (notes != null) flow.notes = notes;
+
+    pushLog(r, "flow_complete", req.user?._id || req.user?.id, {
+      flowId: flow._id,
+      price: flow.price,
+      notes: flow.notes || "",
+    });
+
+    await r.save();
+
+    const out = await Repair.findById(r._id)
+      .select("flows currentDepartment")
+      .populate("flows.department", "name")
+      .populate("flows.technician", "name username email")
+      .lean();
+    res.json(out);
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ===== Move next ===== */
+router.put("/:id/move-next", async (req, res, next) => {
+  try {
+    const { departmentId } = req.body;
+    if (!departmentId)
+      return res.status(400).json({ error: "MissingDepartment" });
+
+    const r = await Repair.findById(req.params.id);
+    if (!r) return res.status(404).json({ error: "NotFound" });
+
+    const cur = currentFlow(r);
+    if (!cur || cur.flow.status !== "completed") {
+      if (cur && cur.flow.status !== "completed")
+        return res.status(409).json({ error: "CurrentNotCompleted" });
+    } else {
+      await assertCanManageStep(req, r, cur.flow, "move_next");
+    }
+
+    r.flows.push({
+      department: departmentId,
+      status: "waiting",
+      technician: null,
+      startedAt: null,
+      completedAt: null,
+    });
+    r.currentDepartment = departmentId;
+    r.department = departmentId;
+
+    pushLog(r, "move_next", req.user?._id || req.user?.id, { departmentId });
+
+    await r.save();
+
+    const out = await Repair.findById(r._id)
+      .select("flows currentDepartment")
+      .populate("flows.department", "name")
+      .populate("flows.technician", "name username email")
+      .lean();
+
+    res.json(out);
+  } catch (e) {
+    next(e);
+  }
+});
+
+/* ===== Warranty ===== */
 function normalizeRejectedLocation(v) {
   if (v == null) return null;
   const s = String(v).trim();
@@ -380,9 +639,7 @@ function normalizeRejectedLocation(v) {
 
   if (hasClient) return "مع العميل";
   if (hasShop) return "بالمحل";
-
   if (s === "مع العميل" || s === "بالمحل") return s;
-
   return null;
 }
 
@@ -412,7 +669,7 @@ router.post(
   }
 );
 
-// Create a customer-facing update (text/image/video/audio)
+/* ===== Customer updates (public) ===== */
 router.post(
   "/:id/customer-updates",
   auth,
@@ -441,227 +698,223 @@ router.post(
   }
 );
 
-// (متروك للتوافق إن كنت تستخدمه في مكان آخر)
-exports.setWarranty = async (req, res) => {
-  const { warrantyEnd, warrantyNotes } = req.body;
-  if (!warrantyEnd)
-    return res.status(400).json({ message: "warrantyEnd required" });
-  const repair = await Repair.findById(req.params.id);
-  if (!repair) return res.status(404).json({ message: "Not found" });
+/* ===== UPDATE (also handles status transitions) ===== */
+router.put("/:id", async (req, res, next) => {
+  try {
+    const repair = await Repair.findById(req.params.id);
+    if (!repair) return res.status(404).json({ message: "Not found" });
 
-  repair.hasWarranty = true;
-  repair.warrantyEnd = new Date(warrantyEnd);
-  if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
-  await repair.save();
+    const body = req.body || {};
+    const user = req.user;
 
-  req.io
-    ?.to(`repair:${repair._id}`)
-    .emit("repairs:changed", { id: repair._id });
-  return res.json({ ok: true });
-};
+    // Warranty fields
+    const { hasWarranty, warrantyEnd, warrantyNotes } = body;
+    if (typeof hasWarranty === "boolean") repair.hasWarranty = hasWarranty;
+    if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
+    if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
 
-// ===== UPDATE =====
-router.put("/:id", async (req, res) => {
-  const repair = await Repair.findById(req.params.id);
-  if (!repair) return res.status(404).json({ message: "Not found" });
+    const canEditAll =
+      user.role === "admin" ||
+      user.permissions?.adminOverride ||
+      user.permissions?.editRepair;
+    const isAssignedTech =
+      repair.technician && String(repair.technician) === String(user.id);
 
-  const body = req.body || {};
-  const user = req.user;
+    if (!canEditAll) {
+      if (!isAssignedTech)
+        return res.status(403).json({ message: "غير مسموح بالتعديل" });
 
-  // حقول الضمان (تُسمح مع من يملك صلاحية editRepair)
-  const { hasWarranty, warrantyEnd, warrantyNotes } = body;
-  if (typeof hasWarranty === "boolean") repair.hasWarranty = hasWarranty;
-  if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
-  if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
+      const allowedKeys = ["status", "password"];
+      if (body.status === "تم التسليم") allowedKeys.push("finalPrice", "parts");
+      if (body.status === "مرفوض") allowedKeys.push("rejectedDeviceLocation");
 
-  const canEditAll =
-    user.role === "admin" ||
-    user.permissions?.adminOverride ||
-    user.permissions?.editRepair;
-  const isAssignedTech =
-    repair.technician && String(repair.technician) === String(user.id);
+      const unknown = Object.keys(body).filter((k) => !allowedKeys.includes(k));
+      if (unknown.length)
+        return res.status(403).json({ message: "غير مسموح بالتعديل" });
 
-  if (!canEditAll) {
-    if (!isAssignedTech)
-      return res.status(403).json({ message: "غير مسموح بالتعديل" });
+      if (!body.password)
+        return res.status(400).json({ message: "مطلوب كلمة السر للتأكيد" });
+      const fresh = await User.findById(user.id);
+      const ok = await fresh.comparePassword(body.password);
+      if (!ok) return res.status(400).json({ message: "كلمة السر غير صحيحة" });
+    }
 
-    const allowedKeys = ["status", "password"];
-    if (body.status === "تم التسليم") allowedKeys.push("finalPrice", "parts");
-    if (body.status === "مرفوض") allowedKeys.push("rejectedDeviceLocation");
+    const before = repair.toObject();
 
-    const unknown = Object.keys(body).filter((k) => !allowedKeys.includes(k));
-    if (unknown.length)
-      return res.status(403).json({ message: "غير مسموح بالتعديل" });
+    if (body.status) {
+      if (body.status === "جاري العمل" && !repair.startTime)
+        repair.startTime = new Date();
+      if (body.status === "مكتمل" && !repair.endTime)
+        repair.endTime = new Date();
+      if (body.status === "تم التسليم") {
+        repair.deliveryDate = new Date();
+        repair.returned = false;
+        repair.returnDate = undefined;
+        if (typeof body.finalPrice !== "undefined")
+          repair.finalPrice = Number(body.finalPrice) || 0;
+        if (Array.isArray(body.parts)) repair.parts = body.parts;
+      }
+      if (body.status === "مرتجع") {
+        repair.returned = true;
+        repair.returnDate = new Date();
+      }
+      if (body.status === "مرفوض") {
+        let loc = normalizeRejectedLocation(body.rejectedDeviceLocation);
+        if (!loc) loc = "بالمحل";
+        repair.rejectedDeviceLocation = loc;
+        if (loc === "مع العميل") {
+          if (!repair.deliveryDate) repair.deliveryDate = new Date();
+        } else {
+          repair.deliveryDate = undefined;
+        }
+      }
+      repair.status = body.status;
 
-    if (!body.password)
-      return res.status(400).json({ message: "مطلوب كلمة السر للتأكيد" });
-    const fresh = await User.findById(user.id);
-    const ok = await fresh.comparePassword(body.password);
-    if (!ok) return res.status(400).json({ message: "كلمة السر غير صحيحة" });
-  }
+      pushLog(repair, "status_change", user._id, { status: body.status });
+    }
 
-  const before = repair.toObject();
-
-  if (body.status) {
-    if (body.status === "جاري العمل" && !repair.startTime)
-      repair.startTime = new Date();
-    if (body.status === "مكتمل" && !repair.endTime) repair.endTime = new Date();
-    if (body.status === "تم التسليم") {
-      repair.deliveryDate = new Date();
-      repair.returned = false;
-      repair.returnDate = undefined;
-      if (typeof body.finalPrice !== "undefined")
+    if (canEditAll) {
+      const assignIfDefined = (key, castFn) => {
+        if (Object.prototype.hasOwnProperty.call(body, key)) {
+          repair[key] = castFn ? castFn(body[key]) : body[key];
+        }
+      };
+      assignIfDefined("customerName");
+      assignIfDefined("phone");
+      assignIfDefined("deviceType");
+      assignIfDefined("color");
+      assignIfDefined("issue");
+      if (
+        typeof body.finalPrice !== "undefined" &&
+        body.status !== "تم التسليم"
+      ) {
         repair.finalPrice = Number(body.finalPrice) || 0;
-      if (Array.isArray(body.parts)) repair.parts = body.parts;
-    }
-    if (body.status === "مرتجع") {
-      repair.returned = true;
-      repair.returnDate = new Date();
-    }
-    if (body.status === "مرفوض") {
-      let loc = normalizeRejectedLocation(body.rejectedDeviceLocation);
-      if (!loc) loc = "بالمحل";
-      repair.rejectedDeviceLocation = loc;
-
-      if (loc === "مع العميل") {
-        if (!repair.deliveryDate) repair.deliveryDate = new Date();
-      } else {
-        repair.deliveryDate = undefined;
       }
-    }
-    repair.status = body.status;
-  }
-
-  if (canEditAll) {
-    const assignIfDefined = (key, castFn) => {
-      if (Object.prototype.hasOwnProperty.call(body, key)) {
-        repair[key] = castFn ? castFn(body[key]) : body[key];
+      if (Array.isArray(body.parts) && body.status !== "تم التسليم")
+        repair.parts = body.parts;
+      assignIfDefined("notes");
+      assignIfDefined("eta", (v) => (v ? new Date(v) : null));
+      assignIfDefined("notesPublic");
+      if (
+        body.technician &&
+        String(body.technician) !== String(repair.technician || "")
+      ) {
+        repair.technician = body.technician;
       }
-    };
-    assignIfDefined("customerName");
-    assignIfDefined("phone");
-    assignIfDefined("deviceType");
-    assignIfDefined("color");
-    assignIfDefined("issue");
-    // price: متروك كما كان
-    if (
-      typeof body.finalPrice !== "undefined" &&
-      body.status !== "تم التسليم"
-    ) {
-      repair.finalPrice = Number(body.finalPrice) || 0;
+      if (body.recipient) repair.recipient = body.recipient;
     }
-    if (Array.isArray(body.parts) && body.status !== "تم التسليم")
-      repair.parts = body.parts;
-    assignIfDefined("notes");
-    assignIfDefined("eta", (v) => (v ? new Date(v) : null));
-    assignIfDefined("notesPublic");
-    if (
-      body.technician &&
-      String(body.technician) !== String(repair.technician || "")
-    ) {
-      repair.technician = body.technician;
-    }
-    if (body.recipient) repair.recipient = body.recipient;
-  }
 
-  repair.updatedBy = user.id;
-  await repair.save();
+    repair.updatedBy = user.id;
+    await repair.save();
 
-  const fieldsToTrack = [
-    "status",
-    "technician",
-    "finalPrice",
-    "notes",
-    "recipient",
-    "parts",
-    "deliveryDate",
-    "returnDate",
-    "rejectedDeviceLocation",
-    "customerName",
-    "phone",
-    "deviceType",
-    "color",
-    "issue",
-    "price",
-    "eta",
-    "notesPublic",
-    "hasWarranty",
-    "warrantyEnd",
-    "warrantyNotes",
-  ];
-  const after = repair.toObject();
-  const changes = diffChanges(before, after, fieldsToTrack);
-  const log = await Log.create({
-    repair: repair._id,
-    action: body.status && !canEditAll ? "status_change" : "update",
-    changedBy: user.id,
-    details: "تعديل على الصيانة",
-    changes,
-  });
-  await Repair.findByIdAndUpdate(repair._id, { $push: { logs: log._id } });
+    const fieldsToTrack = [
+      "status",
+      "technician",
+      "finalPrice",
+      "notes",
+      "recipient",
+      "parts",
+      "deliveryDate",
+      "returnDate",
+      "rejectedDeviceLocation",
+      "customerName",
+      "phone",
+      "deviceType",
+      "color",
+      "issue",
+      "price",
+      "eta",
+      "notesPublic",
+      "hasWarranty",
+      "warrantyEnd",
+      "warrantyNotes",
+    ];
+    const after = repair.toObject();
+    const changes = diffChanges(before, after, fieldsToTrack);
 
-  // بثّ عام (لو التتبّع شغّال)
-  const io = req.app.get("io");
-  const token = repair.publicTracking?.enabled && repair.publicTracking?.token;
-  if (io && token) {
-    io.to(`public:${token}`).emit(
-      "public:repair:update",
-      publicPatchView(repair)
+    pushLog(
+      repair,
+      body.status && !canEditAll ? "status_change" : "update",
+      req.user?._id || req.user?.id,
+      {
+        changes,
+      }
     );
-  }
+    await repair.save();
 
-  const admins = await getAdmins();
-  const recipients = new Set(admins.map((a) => a._id.toString()));
-  if (repair.technician) recipients.add(String(repair.technician));
-  await notifyUsers(
-    req,
-    [...recipients],
-    `تم تحديث صيانة #${repair.repairId}`,
-    "repair",
-    {
-      repairId: repair._id,
-      deviceType: repair.deviceType,
-      repairNumber: repair.repairId,
-      changes: summarizeChanges(changes),
+    const io = req.app.get("io");
+    const token =
+      repair.publicTracking?.enabled && repair.publicTracking?.token;
+    if (io && token) {
+      io.to(`public:${token}`).emit(
+        "public:repair:update",
+        publicPatchView(repair)
+      );
     }
-  );
 
-  const populated = await Repair.findById(repair._id)
-    .populate("technician", "name")
-    .populate("recipient", "name")
-    .populate("createdBy", "name")
-    .lean();
+    const admins = await getAdmins();
+    const recipients = new Set(admins.map((a) => a._id.toString()));
+    if (repair.technician) recipients.add(String(repair.technician));
+    notifyUsers(
+      req,
+      [...recipients],
+      `تم تحديث صيانة #${repair.repairId}`,
+      "repair",
+      {
+        repairId: repair._id,
+        deviceType: repair.deviceType,
+        repairNumber: repair.repairId,
+        changes: summarizeChanges(changes),
+      }
+    );
 
-  res.json(populated);
+    const populated = await Repair.findById(repair._id)
+      .populate("technician", "name")
+      .populate("recipient", "name")
+      .populate("createdBy", "name")
+      .lean();
+
+    // رجّع اللوجز بشكل منظّف
+    populated.logs = normalizeLogsForRead(populated.logs, 200);
+
+    res.json(populated);
+  } catch (e) {
+    console.error("update repair error:", e);
+    next(e);
+  }
 });
 
-// ===== DELETE =====
+/* ===== DELETE ===== */
 router.delete(
   "/:id",
-  require("../middleware/checkPermission")("deleteRepair"),
-  async (req, res) => {
-    const r = await Repair.findById(req.params.id);
-    if (!r) return res.status(404).json({ message: "Not found" });
-    await Repair.deleteOne({ _id: r._id });
-    const log = await Log.create({
-      repair: r._id,
-      action: "delete",
-      changedBy: req.user.id,
-      details: "حذف الصيانة",
-    });
-    const admins = await getAdmins();
-    await notifyUsers(
-      req,
-      admins.map((a) => a._id),
-      `تم حذف صيانة #${r.repairId}`,
-      "repair",
-      { repairId: r._id }
-    );
-    res.json({ ok: true, logId: log._id });
+  checkPermission("deleteRepair"),
+  async (req, res, next) => {
+    try {
+      const r = await Repair.findById(req.params.id);
+      if (!r) return res.status(404).json({ message: "Not found" });
+
+      pushLog(r, "delete", req.user?._id || req.user?.id, {});
+      await r.save();
+
+      await Repair.deleteOne({ _id: r._id });
+
+      const admins = await getAdmins();
+      notifyUsers(
+        req,
+        admins.map((a) => a._id),
+        `تم حذف صيانة #${r.repairId}`,
+        "repair",
+        { repairId: r._id }
+      );
+      res.json({ ok: true });
+    } catch (e) {
+      console.error("delete repair error:", e);
+      next(e);
+    }
   }
 );
 
-// ===== إدارة تتبّع عام
+/* ===== Public tracking on/off ===== */
 router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
   const { id } = req.params;
   const { enabled, regenerate, showPrice, showEta } = req.body || {};
@@ -691,7 +944,7 @@ router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
   });
 });
 
-// ===== QR SVG جاهز للطباعة
+/* ===== QR SVG ===== */
 router.get("/:id/public-qr.svg", requireAny(isAdmin), async (req, res) => {
   const r = await Repair.findById(req.params.id)
     .select("publicTracking repairId deviceType")

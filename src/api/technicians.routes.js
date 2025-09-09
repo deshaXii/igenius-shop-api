@@ -7,8 +7,19 @@ const auth = require("../middleware/auth");
 const checkPermission = require("../middleware/checkPermission");
 const calcProfit = require("../utils/calculateProfit");
 const bcrypt = require("bcryptjs");
+const requireAuth = require("../middleware/requireAuth");
+const Technician = require("../models/User.model");
+const Department = require("../models/Department.model");
+// أدوات صلاحيات سريعة
+function isAdmin(u) {
+  return u && (u.role === "admin" || u.isAdmin === true);
+}
+async function isMonitorOf(userId, deptId) {
+  const d = await Department.findById(deptId).select("monitor");
+  return !!(d && d.monitor && d.monitor.toString() === String(userId));
+}
 
-router.use(auth);
+router.use(requireAuth);
 
 // مفاتيح الصلاحيات المعتمدة في الواجهة
 const PERM_KEYS = [
@@ -20,7 +31,10 @@ const PERM_KEYS = [
   "settings",
   "adminOverride",
 ];
-
+function ensureAuth(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
 // تحويل أي قيمة إلى Boolean مضبوط
 const toBool = (v) =>
   v === true ||
@@ -39,18 +53,31 @@ function normalizePerms(doc) {
 }
 
 // ========== قائمة الفنيين ==========
-router.get("/", async (req, res) => {
-  const techs = await User.find({ role: "technician" })
-    .select("name username commissionPct permissions perms createdAt")
-    .lean();
+router.get("/", async (req, res, next) => {
+  try {
+    const { department } = req.query;
+    const q = {};
+    if (department === "null") q.department = null;
+    else if (department) q.department = department;
 
-  const result = techs.map((t) => ({
-    ...t,
-    permissions: normalizePerms(t),
-  }));
-  res.json(result);
+    // (اختياري) لو مستخدم "مراقب قسم" فقط، قَيِّد بما يخص قسمه
+    if (!isAdmin(req.user) && !department) {
+      const mine = await Department.findOne({ monitor: req.user._id }).select(
+        "_id"
+      );
+      if (!mine) return res.json([]);
+      q.department = mine._id;
+    }
+
+    const list = await Technician.find(q)
+      .select("name username email phone department")
+      .populate("department", "name")
+      .lean();
+    res.json(list);
+  } catch (e) {
+    next(e);
+  }
 });
-
 // ========== بروفايل الفني ==========
 router.get("/:id/profile", async (req, res) => {
   const techId = req.params.id;
@@ -137,6 +164,26 @@ router.put("/:id", checkPermission("adminOverride"), async (req, res) => {
 
   await u.save();
   res.json({ ok: true, permissions: normalizePerms(u) });
+});
+
+// PUT /api/technicians/:id/department { departmentId }
+router.put("/:id/department", async (req, res, next) => {
+  try {
+    const { departmentId } = req.body;
+    if (!isAdmin(req.user)) {
+      if (!departmentId) return res.status(403).json({ error: "Forbidden" });
+      const ok = await isMonitorOf(req.user._id, departmentId);
+      if (!ok) return res.status(403).json({ error: "Forbidden" });
+    }
+    const updated = await Technician.findByIdAndUpdate(
+      req.params.id,
+      { $set: { department: departmentId || null } },
+      { new: true }
+    );
+    res.json(updated);
+  } catch (e) {
+    next(e);
+  }
 });
 
 // ========== حذف فني ==========

@@ -27,6 +27,11 @@ const UserSchema = new mongoose.Schema(
     permissions: { type: PermissionsSchema, default: () => ({}) },
     // النسبة الخاصة بالفني (إن وُجدت) — تمثل نسبة الفني من ربح الصيانة (0-100)
     commissionPct: { type: Number, min: 0, max: 100, default: undefined },
+    department: {
+      type: require("mongoose").Schema.Types.ObjectId,
+      ref: "Department",
+      default: null,
+    },
   },
   { timestamps: true }
 );
