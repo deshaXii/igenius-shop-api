@@ -4,6 +4,7 @@ const Department = require("../models/Department.model");
 const Technician = require("../models/User.model");
 const requireAuth = require("../middleware/requireAuth");
 const Repair = require("../models/Repair.model");
+const mongoose = require("mongoose");
 
 // نفترض إن auth middleware سابقًا بيحط req.user { _id, role }.
 // دوال مساعدة بسيطة:
@@ -131,7 +132,9 @@ router.get("/:id/repairs", async (req, res, next) => {
     if (status) q.status = status;
 
     const list = await Repair.find(q)
-      .select("code status customer device createdAt updatedAt technician")
+      .select(
+        "code status customerName deviceType createdAt updatedAt technician"
+      )
       .populate("technician", "name username email")
       .sort({ updatedAt: -1 })
       .limit(Math.min(parseInt(limit, 10) || 20, 100))

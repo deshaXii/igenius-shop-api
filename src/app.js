@@ -13,6 +13,8 @@ require("dotenv").config();
 const app = express();
 
 // --- أمان وأساسيات
+app.set("trust proxy", 1);
+
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: "5mb" }));
 app.use(express.urlencoded({ extended: true, limit: "5mb" }));
