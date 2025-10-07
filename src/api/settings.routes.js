@@ -1,47 +1,151 @@
 // src/api/settings.routes.js
+"use strict";
+
 const express = require("express");
 const router = express.Router();
 const Settings = require("../models/Settings.model");
 const User = require("../models/User.model");
-const auth = require("../middleware/auth");
-const checkPermission = require("../middleware/checkPermission");
+const QRCode = require("qrcode");
 
-router.use(auth);
-router.use(checkPermission("accessAccounts")); // أو أن تجعلها admin-only حسب رغبتك
+// ✅ خليك متسق مع بقية المشروع
+const requireAuth = require("../middleware/requireAuth");
 
-// Get settings
-router.get("/", async (req, res) => {
-  const s = await Settings.findOne().lean();
-  res.json(s || { defaultTechCommissionPct: 50 });
+// لو حابب تسيب checkPermission موجود، ماشي
+// بس هنا هنعمل ضمانة أوضح للوصول
+// const checkPermission = require("../middleware/checkPermission");
+
+/* ----------------- Middleware ----------------- */
+router.use(requireAuth);
+
+// إذن الوصول للإعدادات: admin | adminOverride | accessAccounts
+function ensureSettingsAccess(req, res, next) {
+  const u = req.user || {};
+  const p = (u.permissions || {});
+  if (u.role === "admin" || p.adminOverride === true || p.accessAccounts === true) {
+    return next();
+  }
+  return res.status(403).json({ error: "Forbidden" });
+}
+
+/* ---------- Helpers ---------- */
+async function getSettingsDoc() {
+  let s = await Settings.findOne();
+  if (!s) {
+    s = new Settings();
+    await s.save();
+  }
+  return s;
+}
+
+/* ---------- GET settings ---------- */
+router.get("/", ensureSettingsAccess, async (req, res) => {
+  const s = await getSettingsDoc();
+  res.json({
+    defaultTechCommissionPct: s.defaultTechCommissionPct,
+    phoneNumbers: s.phoneNumbers || [],
+    socialLinks: s.socialLinks || [],
+    receiptMessage: s.receiptMessage || "",
+    receiptFontSizePt: s.receiptFontSizePt,
+    receiptPaperWidthMm: s.receiptPaperWidthMm,
+    receiptMarginMm: s.receiptMarginMm,
+  });
 });
 
-// Update default commission pct
-router.put("/", async (req, res) => {
+/* ---------- Update default commission ---------- */
+router.put("/", ensureSettingsAccess, async (req, res) => {
   const pct = Number(req.body.defaultTechCommissionPct);
   if (isNaN(pct) || pct < 0 || pct > 100) {
     return res.status(400).json({ message: "Invalid percentage" });
   }
-  let s = await Settings.findOne();
-  if (!s) s = new Settings();
+  const s = await getSettingsDoc();
   s.defaultTechCommissionPct = pct;
   await s.save();
   res.json({ ok: true, settings: { defaultTechCommissionPct: pct } });
 });
 
-// Set per-technician override
-router.put("/technicians/:id/commission", async (req, res) => {
-  const pct = Number(req.body.commissionPct);
-  if (isNaN(pct) || pct < 0 || pct > 100) {
-    return res.status(400).json({ message: "Invalid percentage" });
+/* ---------- Update phone numbers ---------- */
+router.put("/phones", ensureSettingsAccess, async (req, res) => {
+  const phones = Array.isArray(req.body.phoneNumbers)
+    ? req.body.phoneNumbers.map((p) => String(p).trim()).filter(Boolean)
+    : [];
+  const s = await getSettingsDoc();
+  s.phoneNumbers = phones;
+  await s.save();
+  res.json({ ok: true, phoneNumbers: s.phoneNumbers });
+});
+
+/* ---------- Update social links ---------- */
+router.put("/social", ensureSettingsAccess, async (req, res) => {
+  const links = Array.isArray(req.body.socialLinks) ? req.body.socialLinks : [];
+  const clean = links
+    .map((x) => ({
+      platform: String(x.platform || "").trim(),
+      url: String(x.url || "").trim(),
+    }))
+    .filter((x) => x.platform && x.url);
+  const s = await getSettingsDoc();
+  s.socialLinks = clean;
+  await s.save();
+  res.json({ ok: true, socialLinks: s.socialLinks });
+});
+
+/* ---------- Update receipt settings ---------- */
+router.put("/receipt", ensureSettingsAccess, async (req, res) => {
+  const s = await getSettingsDoc();
+  const {
+    receiptMessage = "",
+    receiptFontSizePt,
+    receiptPaperWidthMm,
+    receiptMarginMm,
+  } = req.body || {};
+
+  if (typeof receiptMessage === "string") s.receiptMessage = receiptMessage;
+
+  if (typeof receiptFontSizePt !== "undefined" && !isNaN(Number(receiptFontSizePt))) {
+    const v = Number(receiptFontSizePt);
+    if (v >= 8 && v <= 24) s.receiptFontSizePt = v;
   }
-  const user = await User.findById(req.params.id);
-  if (!user) return res.status(404).json({ message: "Technician not found" });
-  user.commissionPct = pct;
-  await user.save();
+  if (typeof receiptPaperWidthMm !== "undefined" && !isNaN(Number(receiptPaperWidthMm))) {
+    const v = Number(receiptPaperWidthMm);
+    if (v >= 40 && v <= 120) s.receiptPaperWidthMm = v;
+  }
+  if (typeof receiptMarginMm !== "undefined" && !isNaN(Number(receiptMarginMm))) {
+    const v = Number(receiptMarginMm);
+    if (v >= 0 && v <= 20) s.receiptMarginMm = v;
+  }
+
+  await s.save();
   res.json({
     ok: true,
-    user: { id: user._id, commissionPct: user.commissionPct },
+    receipt: {
+      receiptMessage: s.receiptMessage,
+      receiptFontSizePt: s.receiptFontSizePt,
+      receiptPaperWidthMm: s.receiptPaperWidthMm,
+      receiptMarginMm: s.receiptMarginMm,
+    },
   });
+});
+
+/* ---------- Social QR (SVG) ---------- */
+/**
+ * ملحوظة مهمة:
+ * الاندبوينت ده بيرجع صورة SVG، وأغلب المشاريع عاملة Interceptor
+ * يعمل Log out عند أي 401. عشان نتجنّب خروج المستخدم لو الصورة فشلت،
+ * هنسمح بالـ token من الكويري `?token=` برضه (auth middleware بتاعك بيدعمه).
+ *
+ * وكمان نمرره بنفس ensureSettingsAccess عشان مايبقاش مفتوح.
+ */
+router.get("/social/:idx/qr.svg", ensureSettingsAccess, async (req, res) => {
+  const idx = Number(req.params.idx);
+  const s = await getSettingsDoc();
+  const links = s.socialLinks || [];
+  if (isNaN(idx) || idx < 0 || idx >= links.length) {
+    return res.status(404).end();
+  }
+  const url = links[idx].url;
+  res.setHeader("Content-Type", "image/svg+xml");
+  const svg = await QRCode.toString(url, { type: "svg", margin: 0, width: 256 });
+  return res.send(svg);
 });
 
 module.exports = router;

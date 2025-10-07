@@ -1,30 +1,38 @@
-// module.exports = (permission) => {
-//   return (req, res, next) => {
-//     const user = req.user;
-
-//     if (
-//       user?.role === "admin" ||
-//       user?.permissions?.isAdmin ||
-//       user?.permissions?.[permission]
-//     ) {
-//       return next();
-//     }
-
-//     return res.status(403).json({ message: "ليس لديك صلاحية" });
-//   };
-// };
-
 // src/middleware/checkPermission.js
-module.exports = function checkPermission(permission) {
-  return (req, res, next) => {
-    const user = req.user;
-    if (!user) return res.status(401).json({ message: "Unauthorized" });
+"use strict";
 
-    if (user.role === "admin") return next();
-    const p = user.permissions || {};
-    if (p.adminOverride) return next();
-    if (permission && p[permission]) return next();
+const { getAuthContext, normalizePerms } = require("../utils/authz");
 
-    return res.status(403).json({ message: "Forbidden" });
+/**
+ * checkPermission(requiredKey, opts?)
+ * - requiredKey: اسم الصلاحية (مثال: 'adminOverride' أو 'editRepair' ...الخ)
+ * - opts.allowAdmin = true بشكل افتراضي: لو المستخدم أدمن (role=admin) أو adminOverride يمر.
+ */
+function checkPermission(requiredKey, opts = {}) {
+  const { allowAdmin = true } = opts;
+
+  return async function (req, res, next) {
+    try {
+      const { dbUser, isAdmin, perms } = await getAuthContext(req);
+
+      if (!dbUser) return res.status(401).json({ error: "Unauthorized" });
+
+      // أدمن شامل؟
+      if (allowAdmin && isAdmin) return next();
+
+      // لو طالبين صلاحية معينة
+      if (requiredKey) {
+        const p = normalizePerms(dbUser);
+        if (p[requiredKey] === true) return next();
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
+      // مفيش requiredKey → اعتبر وجود المستخدم كفاية
+      return next();
+    } catch (e) {
+      next(e);
+    }
   };
-};
+}
+
+module.exports = checkPermission;

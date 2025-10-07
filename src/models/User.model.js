@@ -10,6 +10,8 @@ const PermissionsSchema = new mongoose.Schema(
     receiveDevice: { type: Boolean, default: false },
     accessAccounts: { type: Boolean, default: false },
     adminOverride: { type: Boolean, default: false },
+    // دعمًا لما تتوقعه الواجهة
+    settings: { type: Boolean, default: false },
   },
   { _id: false }
 );
@@ -19,16 +21,27 @@ const UserSchema = new mongoose.Schema(
     username: { type: String, unique: true, required: true, trim: true },
     name: { type: String, required: true, trim: true },
     password: { type: String, required: true },
+    email: { type: String, required: false },
     role: {
       type: String,
       enum: ["admin", "technician"],
       default: "technician",
     },
+
+    // صلاحيات مضبوطة على الـSchema
     permissions: { type: PermissionsSchema, default: () => ({}) },
-    // النسبة الخاصة بالفني (إن وُجدت) — تمثل نسبة الفني من ربح الصيانة (0-100)
+
+    // للتوافق مع إصدارات قديمة كانت تستخدم perms حر
+    perms: { type: mongoose.Schema.Types.Mixed, default: undefined },
+
+    // فلاغ يوسّم الأدمن الأساسي القادم من seed
+    isSeedAdmin: { type: Boolean, default: false, index: true },
+
+    // نسبة الفني
     commissionPct: { type: Number, min: 0, max: 100, default: undefined },
+
     department: {
-      type: require("mongoose").Schema.Types.ObjectId,
+      type: mongoose.Schema.Types.ObjectId,
       ref: "Department",
       default: null,
     },

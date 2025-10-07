@@ -42,6 +42,19 @@ router.post("/", async (req, res) => {
   }
 });
 
+router.delete("/:id", async (req, res, next) => {
+  try {
+    const s = await Supplier.findById(req.params.id);
+    if (!s) return res.status(404).json({ message: "Not found" });
+    await s.save();
+    await Supplier.deleteOne({ _id: s._id });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("delete supplier error:", e);
+    next(e);
+  }
+});
+
 // ✅ إحضار مورد واحد
 router.get("/:id", async (req, res) => {
   await ensureShop();

@@ -5,15 +5,55 @@ const Technician = require("../models/User.model");
 const requireAuth = require("../middleware/requireAuth");
 const Repair = require("../models/Repair.model");
 const mongoose = require("mongoose");
+const User = require("../models/User.model");
 
-// نفترض إن auth middleware سابقًا بيحط req.user { _id, role }.
-// دوال مساعدة بسيطة:
-function ensureAuth(req, res, next) {
-  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
-  next();
+/* ===== Helpers ===== */
+
+const PERM_KEYS = [
+  "accessAccounts",
+  "addRepair",
+  "editRepair",
+  "deleteRepair",
+  "receiveDevice",
+  "settings",
+  "adminOverride",
+];
+
+const toBool = (v) =>
+  v === true || v === 1 || v === "1" || v === "true" || v === "on" || v === "yes";
+
+function normalizePerms(doc) {
+  const src = (doc && (doc.permissions || doc.perms || doc)) || {};
+  const out = {};
+  for (const k of PERM_KEYS) out[k] = toBool(src[k] ?? false);
+
+  // توحيد صلاحية الاستلام/الإضافة
+  if (out.addRepair || out.receiveDevice) {
+    out.addRepair = true;
+    out.receiveDevice = true;
+  }
+
+  if (out.adminOverride) {
+    for (const k of PERM_KEYS) out[k] = true;
+  }
+  return out;
 }
-function isAdmin(u) {
-  return u && (u.role === "admin" || u.isAdmin === true);
+
+// نجيب المستخدم كامل من الداتا ونبني كونتكست صلاحيات موثوق
+async function getAuthContext(req) {
+  const base = req.user || {};
+  const dbUser = await User.findById(base._id)
+    .select("role permissions perms isSeedAdmin")
+    .lean();
+
+  const perms = normalizePerms(dbUser || base || {});
+  const isAdmin =
+    !!dbUser &&
+    (dbUser.role === "admin" || perms.adminOverride === true || base.isAdmin === true);
+
+  const hasIntake = perms.addRepair || perms.receiveDevice;
+
+  return { dbUser, perms, isAdmin, hasIntake };
 }
 
 // هل المستخدم مراقب هذا القسم؟
@@ -25,18 +65,20 @@ async function isMonitorOf(userId, deptId) {
 // كل راوت هنا لازم يبقى Authenticated
 router.use(requireAuth);
 
-// GET /api/departments  => admin: الكل، monitor: قسمه فقط
+// GET /api/departments
+// admin أو صاحب intake: يرى كل الأقسام (قراءة فقط)
+// monitor فقط: يرى قسمه فقط
 router.get("/", async (req, res, next) => {
   try {
+    const { isAdmin, hasIntake, dbUser } = await getAuthContext(req);
+
     let query = {};
-    if (!isAdmin(req.user)) {
-      // لو هو مراقب لقسم ما — رجّع قسمه فقط
-      const mine = await Department.findOne({ monitor: req.user._id }).select(
-        "_id"
-      );
-      if (!mine) return res.json([]); // مش أدمن ولا مراقب
+    if (!(isAdmin || hasIntake)) {
+      const mine = await Department.findOne({ monitor: dbUser?._id }).select("_id");
+      if (!mine) return res.json([]);
       query = { _id: mine._id };
     }
+
     const list = await Department.find(query)
       .populate("monitor", "username name email")
       .sort({ createdAt: -1 })
@@ -62,7 +104,9 @@ router.get("/", async (req, res, next) => {
 // POST /api/departments  (admin فقط)
 router.post("/", async (req, res, next) => {
   try {
-    if (!isAdmin(req.user)) return res.status(403).json({ error: "Forbidden" });
+    const { isAdmin } = await getAuthContext(req);
+    if (!isAdmin) return res.status(403).json({ error: "Forbidden" });
+
     const { name, description } = req.body;
     const created = await Department.create({ name, description });
     res.status(201).json(created);
@@ -74,7 +118,9 @@ router.post("/", async (req, res, next) => {
 // PUT /api/departments/:id  (admin فقط)
 router.put("/:id", async (req, res, next) => {
   try {
-    if (!isAdmin(req.user)) return res.status(403).json({ error: "Forbidden" });
+    const { isAdmin } = await getAuthContext(req);
+    if (!isAdmin) return res.status(403).json({ error: "Forbidden" });
+
     const { name, description } = req.body;
     const updated = await Department.findByIdAndUpdate(
       req.params.id,
@@ -87,12 +133,13 @@ router.put("/:id", async (req, res, next) => {
   }
 });
 
-// DELETE /api/departments/:id  (admin فقط) — اختياري
+// DELETE /api/departments/:id  (admin فقط)
 router.delete("/:id", async (req, res, next) => {
   try {
-    if (!isAdmin(req.user)) return res.status(403).json({ error: "Forbidden" });
+    const { isAdmin } = await getAuthContext(req);
+    if (!isAdmin) return res.status(403).json({ error: "Forbidden" });
+
     await Department.findByIdAndDelete(req.params.id);
-    // لا نحذف الفنيين — فقط نفصل القسم عنهم:
     await Technician.updateMany(
       { department: req.params.id },
       { $set: { department: null } }
@@ -104,8 +151,16 @@ router.delete("/:id", async (req, res, next) => {
 });
 
 // GET /api/departments/:id/repair-stats
+// admin أو hasIntake أو monitor لهذا القسم
 router.get("/:id/repair-stats", async (req, res, next) => {
   try {
+    const { isAdmin, hasIntake, dbUser } = await getAuthContext(req);
+
+    if (!(isAdmin || hasIntake)) {
+      const ok = await isMonitorOf(dbUser?._id, req.params.id);
+      if (!ok) return res.status(403).json({ error: "Forbidden" });
+    }
+
     const depId = new mongoose.Types.ObjectId(req.params.id);
     const stats = await Repair.aggregate([
       { $match: { currentDepartment: depId } },
@@ -123,9 +178,17 @@ router.get("/:id/repair-stats", async (req, res, next) => {
   }
 });
 
-// GET /api/departments/:id/repairs?status=waiting&limit=20
+// GET /api/departments/:id/repairs
+// admin أو hasIntake أو monitor لهذا القسم
 router.get("/:id/repairs", async (req, res, next) => {
   try {
+    const { isAdmin, hasIntake, dbUser } = await getAuthContext(req);
+
+    if (!(isAdmin || hasIntake)) {
+      const ok = await isMonitorOf(dbUser?._id, req.params.id);
+      if (!ok) return res.status(403).json({ error: "Forbidden" });
+    }
+
     const depId = req.params.id;
     const { status, limit = 20, page = 1 } = req.query;
     const q = { currentDepartment: depId };
@@ -149,17 +212,19 @@ router.get("/:id/repairs", async (req, res, next) => {
   }
 });
 
-// PUT /api/departments/:id/monitor  (تعيين مراقب) — admin فقط
+// PUT /api/departments/:id/monitor  (admin فقط)
 router.put("/:id/monitor", async (req, res, next) => {
   try {
-    if (!isAdmin(req.user)) return res.status(403).json({ error: "Forbidden" });
-    const { userId } = req.body; // id للفني/المستخدم
+    const { isAdmin } = await getAuthContext(req);
+    if (!isAdmin) return res.status(403).json({ error: "Forbidden" });
+
+    const { userId } = req.body;
     const dep = await Department.findByIdAndUpdate(
       req.params.id,
       { $set: { monitor: userId || null } },
       { new: true }
     ).populate("monitor", "username name email");
-    // تأكد فني المراقب مُسند لنفس القسم:
+
     if (userId) {
       await Technician.findByIdAndUpdate(userId, {
         $set: { department: dep._id },
@@ -171,11 +236,16 @@ router.put("/:id/monitor", async (req, res, next) => {
   }
 });
 
-// GET /api/departments/:id/technicians  (admin أو مراقب هذا القسم)
+// GET /api/departments/:id/technicians
+// admin أو hasIntake أو monitor لهذا القسم
 router.get("/:id/technicians", async (req, res, next) => {
   try {
-    if (!isAdmin(req.user) && !(await isMonitorOf(req.user._id, req.params.id)))
-      return res.status(403).json({ error: "Forbidden" });
+    const { isAdmin, hasIntake, dbUser } = await getAuthContext(req);
+
+    if (!(isAdmin || hasIntake)) {
+      const ok = await isMonitorOf(dbUser?._id, req.params.id);
+      if (!ok) return res.status(403).json({ error: "Forbidden" });
+    }
 
     const techs = await Technician.find({ department: req.params.id })
       .select("name username email phone department")

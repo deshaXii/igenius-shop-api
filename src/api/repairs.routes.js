@@ -1,3 +1,6 @@
+// src/routes/repairs.routes.js
+"use strict";
+
 const express = require("express");
 const mongoose = require("mongoose");
 const router = express.Router();
@@ -6,18 +9,17 @@ const Repair = require("../models/Repair.model");
 const User = require("../models/User.model");
 const Counter = require("../models/Counter.model");
 const Notification = require("../models/Notification.model");
-// const Settings = require("../models/Settings.model"); // لو محتاجه فعلاً فعّل السطر
+const Department = require("../models/Department.model");
 
 const auth = require("../middleware/auth");
 const checkPermission = require("../middleware/checkPermission");
-const { requireAny, isAdmin, hasPerm } = require("../middleware/perm");
+const { requireAny, isAdmin: isAdminPerm, hasPerm } = require("../middleware/perm");
 const crypto = require("crypto");
 const QRCode = require("qrcode");
 const { sendWebPushToUsers } = require("./push.routes");
 const { fromZonedTime } = require("date-fns-tz");
 const APP_TZ = process.env.APP_TZ || "Africa/Cairo";
 const requireAuth = require("../middleware/requireAuth");
-const Department = require("../models/Department.model");
 
 // ===== Web Push =====
 const webpush = require("web-push");
@@ -33,15 +35,59 @@ try {
       process.env.VAPID_PRIVATE_KEY
     );
   } else {
-    console.warn(
-      "[web-push] VAPID env vars are missing; web push will be skipped."
-    );
+    console.warn("[web-push] VAPID env vars are missing; web push will be skipped.");
   }
 } catch (e) {
   console.error("[web-push] init error:", e);
 }
 
 router.use(requireAuth);
+
+/* ===== AuthZ helpers (normalize perms + context) ===== */
+const PERM_KEYS = [
+  "accessAccounts",
+  "addRepair",
+  "editRepair",
+  "deleteRepair",
+  "receiveDevice",
+  "settings",
+  "adminOverride",
+];
+const toBool = (v) =>
+  v === true || v === 1 || v === "1" || v === "true" || v === "on" || v === "yes";
+
+function normalizePerms(doc) {
+  const src = (doc && (doc.permissions || doc.perms || doc)) || {};
+  const out = {};
+  for (const k of PERM_KEYS) out[k] = toBool(src[k] ?? false);
+
+  // توحيد الاستلام/الإضافة
+  if (out.addRepair || out.receiveDevice) {
+    out.addRepair = true;
+    out.receiveDevice = true;
+  }
+  // أدمن شامل
+  if (out.adminOverride) {
+    for (const k of PERM_KEYS) out[k] = true;
+  }
+  return out;
+}
+
+async function getAuthContext(req) {
+  const base = req.user || {};
+  const dbUser = await User.findById(base._id || base.id)
+    .select("role permissions perms isSeedAdmin department")
+    .lean();
+  const perms = normalizePerms(dbUser || base || {});
+  const isAdmin =
+    !!dbUser &&
+    (dbUser.role === "admin" || perms.adminOverride === true || base.isAdmin === true);
+  const hasIntake = perms.addRepair || perms.receiveDevice;
+  const canEditAll = isAdmin || perms.editRepair === true;
+  const canDelete = isAdmin || perms.deleteRepair === true;
+
+  return { dbUser, perms, isAdmin, hasIntake, canEditAll, canDelete };
+}
 
 /* ===== Logs helpers (embedded) ===== */
 function pushLog(doc, type, by, payload = {}) {
@@ -67,34 +113,15 @@ function normalizeLogsForRead(logs = [], limit = 200) {
 
 /* ===== Helpers ===== */
 async function isMonitorOf(userId, deptId) {
-  const d = await Department.findById(deptId).select("monitor");
+  if (!userId || !deptId) return false;
+  const d = await Department.findById(deptId).select("monitor").lean();
   return !!(d && d.monitor && String(d.monitor) === String(userId));
 }
 function currentFlow(repair) {
   if (!repair.flows || repair.flows.length === 0) return null;
-  const i = [...repair.flows]
-    .reverse()
-    .findIndex((f) => f.status !== "completed");
+  const i = [...repair.flows].reverse().findIndex((f) => f.status !== "completed");
   const idx = i === -1 ? repair.flows.length - 1 : repair.flows.length - 1 - i;
   return { flow: repair.flows[idx], idx };
-}
-function canViewAll(user) {
-  return (
-    user?.role === "admin" ||
-    user?.permissions?.adminOverride ||
-    user?.permissions?.addRepair ||
-    user?.permissions?.receiveDevice
-  );
-}
-function hasEditAll(user) {
-  return (
-    user?.role === "admin" ||
-    user?.permissions?.adminOverride ||
-    user?.permissions?.editRepair
-  );
-}
-function isAssignedTech(flow, userId) {
-  return flow?.technician && String(flow.technician) === String(userId);
 }
 function deny(msg = "Forbidden", code = 403) {
   const err = new Error(msg);
@@ -108,16 +135,17 @@ async function assertCanManageStep(req, repair, flow, action, payload = {}) {
   if (!cur || String(cur.flow._id) !== String(flow._id))
     throw deny("هذه ليست الخطوة الحالية", 403);
 
-  const editor = hasEditAll(req.user);
-  const monitor = await isMonitorOf(req.user._id, flow.department);
-  const assigned = isAssignedTech(flow, req.user._id);
+  const ctx = await getAuthContext(req);
+  const editor = ctx.canEditAll; // أدمن/أدمن صلاحيات أو معه editRepair
+  const monitor = await isMonitorOf(ctx.dbUser?._id, flow.department);
+  const assigned =
+    !!flow?.technician && String(flow.technician) === String(ctx.dbUser?._id);
   const sameDept =
-    String(req.user?.department || "") === String(flow.department || "");
+    String(ctx.dbUser?.department || "") === String(flow.department || "");
 
   if (action === "assign_technician") {
     const selfAssign =
-      payload?.technicianId &&
-      String(payload.technicianId) === String(req.user._id);
+      payload?.technicianId && String(payload.technicianId) === String(ctx.dbUser?._id);
     if (editor || monitor || (selfAssign && sameDept)) return true;
     throw deny(
       "غير مسموح بتعيين فنّي. يُسمح للمراقب/الأدمن أو للفنّي نفسه من نفس القسم.",
@@ -156,14 +184,9 @@ function _label(field) {
 function summarizeChanges(changes = []) {
   return (changes || [])
     .filter((c) =>
-      [
-        "status",
-        "finalPrice",
-        "price",
-        "deliveryDate",
-        "rejectedDeviceLocation",
-        "technician",
-      ].includes(c.field)
+      ["status", "finalPrice", "price", "deliveryDate", "rejectedDeviceLocation", "technician"].includes(
+        c.field
+      )
     )
     .map((c) => ({
       field: c.field,
@@ -226,8 +249,7 @@ function diffChanges(oldDoc, newDoc, fields) {
   fields.forEach((f) => {
     const a = oldDoc[f],
       b = newDoc[f];
-    if (JSON.stringify(a) !== JSON.stringify(b))
-      changes.push({ field: f, from: a, to: b });
+    if (JSON.stringify(a) !== JSON.stringify(b)) changes.push({ field: f, from: a, to: b });
   });
   return changes;
 }
@@ -241,9 +263,7 @@ async function nextRepairId() {
 }
 function baseUrl(req) {
   const host = req.get("x-forwarded-host") || req.get("host");
-  const proto = (req.get("x-forwarded-proto") || req.protocol || "https")
-    .split(",")[0]
-    .trim();
+  const proto = (req.get("x-forwarded-proto") || req.protocol || "https").split(",")[0].trim();
   return `${proto}://${host}`;
 }
 function generateTrackingToken(len = 12) {
@@ -270,14 +290,14 @@ function publicPatchView(r) {
 /* ===== LIST ===== */
 router.get("/", auth, async (req, res) => {
   try {
-    const { q, status, technician, startDate, endDate } = req.query;
+    const ctx = await getAuthContext(req);
+
+    const { q, status, technician, startDate, endDate, department } = req.query;
     const filter = {};
 
     if (q) {
       const rx = new RegExp(
-        String(q)
-          .trim()
-          .replace(/[.*?^${}()|[\]\\]/g, "\\$&"),
+        String(q).trim().replace(/[.*?^${}()|[\]\\]/g, "\\$&"),
         "i"
       );
       filter.$or = [
@@ -290,6 +310,7 @@ router.get("/", auth, async (req, res) => {
     }
     if (status) filter.status = status;
     if (technician) filter.technician = technician;
+    if (department) filter.currentDepartment = department;
 
     if (startDate || endDate) {
       const toUtcStart = (s) => fromZonedTime(`${s} 00:00:00`, APP_TZ);
@@ -307,10 +328,8 @@ router.get("/", auth, async (req, res) => {
         deliveredCond.$lte = end;
       }
       const dateOr = [];
-      if (Object.keys(createdCond).length)
-        dateOr.push({ createdAt: createdCond });
-      if (Object.keys(deliveredCond).length)
-        dateOr.push({ deliveryDate: deliveredCond });
+      if (Object.keys(createdCond).length) dateOr.push({ createdAt: createdCond });
+      if (Object.keys(deliveredCond).length) dateOr.push({ deliveryDate: deliveredCond });
       if (dateOr.length) {
         if (filter.$or) {
           filter.$and = [{ $or: filter.$or }, { $or: dateOr }];
@@ -321,11 +340,22 @@ router.get("/", auth, async (req, res) => {
       }
     }
 
-    if (!canViewAll(req.user)) filter.technician = req.user.id;
+    // تقييدات الرؤية:
+    if (!(ctx.isAdmin || ctx.hasIntake)) {
+      const uid = String(ctx.dbUser?._id || "");
+      if (!department) {
+        const mine = await Department.findOne({ monitor: uid }).select("_id").lean();
+        if (mine) {
+          filter.currentDepartment = mine._id;
+        } else {
+          filter.technician = uid;
+        }
+      }
+    }
 
     const list = await Repair.find(filter)
       .sort({ createdAt: -1 })
-      .populate("technician", "name")
+      .populate("technician", "name username email")
       .populate("createdBy", "name")
       .populate("recipient", "name")
       .lean();
@@ -339,38 +369,56 @@ router.get("/", auth, async (req, res) => {
 
 /* ===== GET one ===== */
 router.get("/:id", async (req, res) => {
-  const r = await Repair.findById(req.params.id)
-    .populate("technician", "name")
-    .populate("recipient", "name")
-    .populate("createdBy", "name")
-    .lean();
-  if (!r) return res.status(404).json({ message: "Not found" });
+  try {
+    const ctx = await getAuthContext(req);
 
-  if (!canViewAll(req.user)) {
-    if (
-      !r.technician ||
-      String(r.technician._id || r.technician) !== String(req.user.id)
-    ) {
-      return res
-        .status(403)
-        .json({ message: "ليست لديك صلاحية عرض هذه الصيانة" });
+    const r = await Repair.findById(req.params.id)
+      .populate("technician", "name username email")
+      .populate("recipient", "name")
+      .populate("createdBy", "name")
+      .lean();
+    if (!r) return res.status(404).json({ message: "Not found" });
+
+    let allowed = false;
+
+    // أدمن/انتك (استلام/إضافة) = يشوف الكل
+    if (ctx.isAdmin || ctx.hasIntake) {
+      allowed = true;
     }
-  }
 
-  r.logs = normalizeLogsForRead(r.logs, 200);
-  res.json(r);
+    // الفني المعيّن
+    if (!allowed && r.technician && String(r.technician._id || r.technician) === String(ctx.dbUser?._id)) {
+      allowed = true;
+    }
+
+    // مراقب القسم الحالي
+    if (!allowed && r.currentDepartment) {
+      const ok = await isMonitorOf(ctx.dbUser?._id, r.currentDepartment);
+      if (ok) allowed = true;
+    }
+
+    if (!allowed) {
+      return res.status(403).json({ message: "ليست لديك صلاحية عرض هذه الصيانة" });
+    }
+
+    r.logs = normalizeLogsForRead(r.logs, 200);
+    res.json(r);
+  } catch (e) {
+    console.error("get repair error:", e);
+    res.status(500).json({ message: "تعذر تحميل البيانات" });
+  }
 });
 
 /* ===== CREATE ===== */
 router.post(
   "/",
   auth,
-  requireAny(isAdmin, hasPerm("addRepair"), hasPerm("receiveDevice")),
+  // ميدلويرك الحالي يسمح بالأدمن (role) أو addRepair/receiveDevice
+  requireAny(isAdminPerm, hasPerm("addRepair"), hasPerm("receiveDevice")),
   async (req, res) => {
     try {
       const payload = req.body || {};
-      const initialDepartment =
-        payload.initialDepartment || payload.department || null;
+      const initialDepartment = payload.initialDepartment || payload.department || null;
       const initialTechnician = payload.technician || null;
 
       payload.repairId = await nextRepairId();
@@ -414,18 +462,12 @@ router.post(
       const recipients = [];
       if (r.technician) recipients.push(r.technician.toString());
       recipients.push(...admins.map((a) => a._id.toString()));
-      notifyUsers(
-        req,
-        recipients,
-        `تم إضافة صيانة جديدة #${r.repairId}`,
-        "repair",
-        {
-          repairId: r._id,
-          deviceType: r.deviceType,
-          repairNumber: r.repairId,
-          changes: [],
-        }
-      );
+      notifyUsers(req, recipients, `تم إضافة صيانة جديدة #${r.repairId}`, "repair", {
+        repairId: r._id,
+        deviceType: r.deviceType,
+        repairNumber: r.repairId,
+        changes: [],
+      });
 
       res.json(r);
     } catch (e) {
@@ -444,6 +486,8 @@ router.post(
 /* ===== TIMELINE + ACL ===== */
 router.get("/:id/timeline", async (req, res) => {
   try {
+    const ctx = await getAuthContext(req);
+
     const { id } = req.params;
     if (!mongoose.Types.ObjectId.isValid(id))
       return res.status(400).json({ error: "InvalidId" });
@@ -456,34 +500,34 @@ router.get("/:id/timeline", async (req, res) => {
 
     if (!r) return res.status(404).json({ error: "NotFound" });
 
+    // تحقق عرض تايملاين: نفس قواعد GET one
+    let allowed = ctx.isAdmin || ctx.hasIntake;
+    if (!allowed && r.currentDepartment) {
+      const ok = await isMonitorOf(ctx.dbUser?._id, r.currentDepartment);
+      if (ok) allowed = true;
+    }
+    if (!allowed && r.flows?.some((f) => String(f.technician?._id || f.technician) === String(ctx.dbUser?._id))) {
+      allowed = true;
+    }
+    if (!allowed) return res.status(403).json({ error: "Forbidden" });
+
     const flows = Array.isArray(r.flows) ? r.flows : [];
     const total = flows.reduce((s, f) => s + (Number(f.price) || 0), 0);
 
     const cur = flows.length ? flows[flows.length - 1] : null;
-    const monitor = cur
-      ? await isMonitorOf(req.user._id, cur.department)
-      : false;
+    const monitor = cur ? await isMonitorOf(ctx.dbUser?._id, cur.department) : false;
     const assigned = cur
-      ? String(cur.technician?._id || cur.technician || "") ===
-        String(req.user._id)
+      ? String(cur.technician?._id || cur.technician || "") === String(ctx.dbUser?._id)
       : false;
-    const editor = hasEditAll(req.user);
+    const editor = ctx.canEditAll;
     const sameDept = cur
-      ? String(req.user?.department || "") === String(cur.department || "")
+      ? String(ctx.dbUser?.department || "") === String(cur.department || "")
       : false;
 
     const acl = {
-      canAssignTech: !!(
-        editor ||
-        monitor ||
-        (sameDept && cur && cur.status !== "completed")
-      ),
+      canAssignTech: !!(editor || monitor || (sameDept && cur && cur.status !== "completed")),
       canCompleteCurrent: !!(editor || monitor || assigned),
-      canMoveNext: !!(
-        editor ||
-        monitor ||
-        (assigned && cur && cur.status === "completed")
-      ),
+      canMoveNext: !!(editor || monitor || (assigned && cur && cur.status === "completed")),
     };
 
     return res.json({
@@ -577,8 +621,7 @@ router.put("/:id/complete-step", async (req, res, next) => {
 router.put("/:id/move-next", async (req, res, next) => {
   try {
     const { departmentId } = req.body;
-    if (!departmentId)
-      return res.status(400).json({ error: "MissingDepartment" });
+    if (!departmentId) return res.status(400).json({ error: "MissingDepartment" });
 
     const r = await Repair.findById(req.params.id);
     if (!r) return res.status(404).json({ error: "NotFound" });
@@ -629,13 +672,8 @@ function normalizeRejectedLocation(v) {
     .replace(/ة/g, "ه")
     .toLowerCase();
 
-  const hasClient =
-    t.includes("عميل") || t.includes("زبون") || t.includes("العميل");
-  const hasShop =
-    t.includes("محل") ||
-    t.includes("المحل") ||
-    t.includes("بالورشه") ||
-    t.includes("بالدكان");
+  const hasClient = t.includes("عميل") || t.includes("زبون") || t.includes("العميل");
+  const hasShop = t.includes("محل") || t.includes("المحل") || t.includes("بالورشه") || t.includes("بالدكان");
 
   if (hasClient) return "مع العميل";
   if (hasShop) return "بالمحل";
@@ -643,69 +681,56 @@ function normalizeRejectedLocation(v) {
   return null;
 }
 
-router.post(
-  "/:id/warranty",
-  auth,
-  checkPermission("editRepair"),
-  async (req, res) => {
-    const { id } = req.params;
-    const {
-      hasWarranty = true,
-      warrantyEnd,
-      warrantyNotes = "",
-    } = req.body || {};
-    const repair = await Repair.findById(id);
-    if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
-    repair.hasWarranty = !!hasWarranty;
-    if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
-    repair.warrantyNotes = String(warrantyNotes || "");
-    await repair.save();
-    return res.json({
-      ok: true,
-      hasWarranty: repair.hasWarranty,
-      warrantyEnd: repair.warrantyEnd,
-      warrantyNotes: repair.warrantyNotes,
-    });
-  }
-);
+router.post("/:id/warranty", auth, checkPermission("editRepair"), async (req, res) => {
+  const { id } = req.params;
+  const { hasWarranty = true, warrantyEnd, warrantyNotes = "" } = req.body || {};
+  const repair = await Repair.findById(id);
+  if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
+  repair.hasWarranty = !!hasWarranty;
+  if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
+  repair.warrantyNotes = String(warrantyNotes || "");
+  await repair.save();
+  return res.json({
+    ok: true,
+    hasWarranty: repair.hasWarranty,
+    warrantyEnd: repair.warrantyEnd,
+    warrantyNotes: repair.warrantyNotes,
+  });
+});
 
 /* ===== Customer updates (public) ===== */
-router.post(
-  "/:id/customer-updates",
-  auth,
-  checkPermission("editRepair"),
-  async (req, res) => {
-    const { id } = req.params;
-    const { type, text, fileUrl, isPublic = true } = req.body || {};
-    if (!["text", "image", "video", "audio"].includes(type)) {
-      return res.status(400).json({ message: "INVALID_TYPE" });
-    }
-    const repair = await Repair.findById(id);
-    if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
-
-    const update = {
-      type,
-      text: type === "text" ? String(text || "") : "",
-      fileUrl: type !== "text" ? String(fileUrl || "") : "",
-      createdBy: req.user?._id || undefined,
-      createdAt: new Date(),
-      isPublic: !!isPublic,
-    };
-    repair.customerUpdates = repair.customerUpdates || [];
-    repair.customerUpdates.push(update);
-    await repair.save();
-    return res.json({ ok: true, update });
+router.post("/:id/customer-updates", auth, checkPermission("editRepair"), async (req, res) => {
+  const { id } = req.params;
+  const { type, text, fileUrl, isPublic = true } = req.body || {};
+  if (!["text", "image", "video", "audio"].includes(type)) {
+    return res.status(400).json({ message: "INVALID_TYPE" });
   }
-);
+  const repair = await Repair.findById(id);
+  if (!repair) return res.status(404).json({ message: "NOT_FOUND" });
+
+  const update = {
+    type,
+    text: type === "text" ? String(text || "") : "",
+    fileUrl: type !== "text" ? String(fileUrl || "") : "",
+    createdBy: req.user?._id || undefined,
+    createdAt: new Date(),
+    isPublic: !!isPublic,
+  };
+  repair.customerUpdates = repair.customerUpdates || [];
+  repair.customerUpdates.push(update);
+  await repair.save();
+  return res.json({ ok: true, update });
+});
 
 /* ===== UPDATE (also handles status transitions) ===== */
 router.put("/:id", async (req, res, next) => {
   try {
+    const ctx = await getAuthContext(req);
     const repair = await Repair.findById(req.params.id);
     if (!repair) return res.status(404).json({ message: "Not found" });
 
     const body = req.body || {};
-    const user = req.user;
+    const userId = ctx.dbUser?._id;
 
     // Warranty fields
     const { hasWarranty, warrantyEnd, warrantyNotes } = body;
@@ -713,28 +738,21 @@ router.put("/:id", async (req, res, next) => {
     if (warrantyEnd) repair.warrantyEnd = new Date(warrantyEnd);
     if (typeof warrantyNotes === "string") repair.warrantyNotes = warrantyNotes;
 
-    const canEditAll =
-      user.role === "admin" ||
-      user.permissions?.adminOverride ||
-      user.permissions?.editRepair;
-    const isAssignedTech =
-      repair.technician && String(repair.technician) === String(user.id);
+    const canEditAll = ctx.canEditAll;
+    const isAssignedTech = repair.technician && String(repair.technician) === String(userId);
 
     if (!canEditAll) {
-      if (!isAssignedTech)
-        return res.status(403).json({ message: "غير مسموح بالتعديل" });
+      if (!isAssignedTech) return res.status(403).json({ message: "غير مسموح بالتعديل" });
 
       const allowedKeys = ["status", "password"];
       if (body.status === "تم التسليم") allowedKeys.push("finalPrice", "parts");
       if (body.status === "مرفوض") allowedKeys.push("rejectedDeviceLocation");
 
       const unknown = Object.keys(body).filter((k) => !allowedKeys.includes(k));
-      if (unknown.length)
-        return res.status(403).json({ message: "غير مسموح بالتعديل" });
+      if (unknown.length) return res.status(403).json({ message: "غير مسموح بالتعديل" });
 
-      if (!body.password)
-        return res.status(400).json({ message: "مطلوب كلمة السر للتأكيد" });
-      const fresh = await User.findById(user.id);
+      if (!body.password) return res.status(400).json({ message: "مطلوب كلمة السر للتأكيد" });
+      const fresh = await User.findById(userId);
       const ok = await fresh.comparePassword(body.password);
       if (!ok) return res.status(400).json({ message: "كلمة السر غير صحيحة" });
     }
@@ -742,16 +760,13 @@ router.put("/:id", async (req, res, next) => {
     const before = repair.toObject();
 
     if (body.status) {
-      if (body.status === "جاري العمل" && !repair.startTime)
-        repair.startTime = new Date();
-      if (body.status === "مكتمل" && !repair.endTime)
-        repair.endTime = new Date();
+      if (body.status === "جاري العمل" && !repair.startTime) repair.startTime = new Date();
+      if (body.status === "مكتمل" && !repair.endTime) repair.endTime = new Date();
       if (body.status === "تم التسليم") {
         repair.deliveryDate = new Date();
         repair.returned = false;
         repair.returnDate = undefined;
-        if (typeof body.finalPrice !== "undefined")
-          repair.finalPrice = Number(body.finalPrice) || 0;
+        if (typeof body.finalPrice !== "undefined") repair.finalPrice = Number(body.finalPrice) || 0;
         if (Array.isArray(body.parts)) repair.parts = body.parts;
       }
       if (body.status === "مرتجع") {
@@ -770,7 +785,7 @@ router.put("/:id", async (req, res, next) => {
       }
       repair.status = body.status;
 
-      pushLog(repair, "status_change", user._id, { status: body.status });
+      pushLog(repair, "status_change", userId, { status: body.status });
     }
 
     if (canEditAll) {
@@ -784,27 +799,20 @@ router.put("/:id", async (req, res, next) => {
       assignIfDefined("deviceType");
       assignIfDefined("color");
       assignIfDefined("issue");
-      if (
-        typeof body.finalPrice !== "undefined" &&
-        body.status !== "تم التسليم"
-      ) {
+      if (typeof body.finalPrice !== "undefined" && body.status !== "تم التسليم") {
         repair.finalPrice = Number(body.finalPrice) || 0;
       }
-      if (Array.isArray(body.parts) && body.status !== "تم التسليم")
-        repair.parts = body.parts;
+      if (Array.isArray(body.parts) && body.status !== "تم التسليم") repair.parts = body.parts;
       assignIfDefined("notes");
       assignIfDefined("eta", (v) => (v ? new Date(v) : null));
       assignIfDefined("notesPublic");
-      if (
-        body.technician &&
-        String(body.technician) !== String(repair.technician || "")
-      ) {
+      if (body.technician && String(body.technician) !== String(repair.technician || "")) {
         repair.technician = body.technician;
       }
       if (body.recipient) repair.recipient = body.recipient;
     }
 
-    repair.updatedBy = user.id;
+    repair.updatedBy = userId;
     await repair.save();
 
     const fieldsToTrack = [
@@ -832,51 +840,34 @@ router.put("/:id", async (req, res, next) => {
     const after = repair.toObject();
     const changes = diffChanges(before, after, fieldsToTrack);
 
-    pushLog(
-      repair,
-      body.status && !canEditAll ? "status_change" : "update",
-      req.user?._id || req.user?.id,
-      {
-        changes,
-      }
-    );
+    pushLog(repair, body.status && !canEditAll ? "status_change" : "update", userId, {
+      changes,
+    });
     await repair.save();
 
     const io = req.app.get("io");
-    const token =
-      repair.publicTracking?.enabled && repair.publicTracking?.token;
+    const token = repair.publicTracking?.enabled && repair.publicTracking?.token;
     if (io && token) {
-      io.to(`public:${token}`).emit(
-        "public:repair:update",
-        publicPatchView(repair)
-      );
+      io.to(`public:${token}`).emit("public:repair:update", publicPatchView(repair));
     }
 
     const admins = await getAdmins();
     const recipients = new Set(admins.map((a) => a._id.toString()));
     if (repair.technician) recipients.add(String(repair.technician));
-    notifyUsers(
-      req,
-      [...recipients],
-      `تم تحديث صيانة #${repair.repairId}`,
-      "repair",
-      {
-        repairId: repair._id,
-        deviceType: repair.deviceType,
-        repairNumber: repair.repairId,
-        changes: summarizeChanges(changes),
-      }
-    );
+    notifyUsers(req, [...recipients], `تم تحديث صيانة #${repair.repairId}`, "repair", {
+      repairId: repair._id,
+      deviceType: repair.deviceType,
+      repairNumber: repair.repairId,
+      changes: summarizeChanges(changes),
+    });
 
     const populated = await Repair.findById(repair._id)
-      .populate("technician", "name")
+      .populate("technician", "name username email")
       .populate("recipient", "name")
       .populate("createdBy", "name")
       .lean();
 
-    // رجّع اللوجز بشكل منظّف
     populated.logs = normalizeLogsForRead(populated.logs, 200);
-
     res.json(populated);
   } catch (e) {
     console.error("update repair error:", e);
@@ -885,37 +876,33 @@ router.put("/:id", async (req, res, next) => {
 });
 
 /* ===== DELETE ===== */
-router.delete(
-  "/:id",
-  checkPermission("deleteRepair"),
-  async (req, res, next) => {
-    try {
-      const r = await Repair.findById(req.params.id);
-      if (!r) return res.status(404).json({ message: "Not found" });
+router.delete("/:id", checkPermission("deleteRepair"), async (req, res, next) => {
+  try {
+    const r = await Repair.findById(req.params.id);
+    if (!r) return res.status(404).json({ message: "Not found" });
 
-      pushLog(r, "delete", req.user?._id || req.user?.id, {});
-      await r.save();
+    pushLog(r, "delete", req.user?._id || req.user?.id, {});
+    await r.save();
 
-      await Repair.deleteOne({ _id: r._id });
+    await Repair.deleteOne({ _id: r._id });
 
-      const admins = await getAdmins();
-      notifyUsers(
-        req,
-        admins.map((a) => a._id),
-        `تم حذف صيانة #${r.repairId}`,
-        "repair",
-        { repairId: r._id }
-      );
-      res.json({ ok: true });
-    } catch (e) {
-      console.error("delete repair error:", e);
-      next(e);
-    }
+    const admins = await getAdmins();
+    notifyUsers(
+      req,
+      admins.map((a) => a._id),
+      `تم حذف صيانة #${r.repairId}`,
+      "repair",
+      { repairId: r._id }
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("delete repair error:", e);
+    next(e);
   }
-);
+});
 
 /* ===== Public tracking on/off ===== */
-router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
+router.post("/:id/public-tracking", requireAny(isAdminPerm), async (req, res) => {
   const { id } = req.params;
   const { enabled, regenerate, showPrice, showEta } = req.body || {};
   const r = await Repair.findById(id);
@@ -923,8 +910,7 @@ router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
 
   if (!r.publicTracking) r.publicTracking = {};
   if (typeof enabled === "boolean") r.publicTracking.enabled = enabled;
-  if (typeof showPrice !== "undefined")
-    r.publicTracking.showPrice = !!showPrice;
+  if (typeof showPrice !== "undefined") r.publicTracking.showPrice = !!showPrice;
   if (typeof showEta !== "undefined") r.publicTracking.showEta = !!showEta;
 
   if (regenerate || !r.publicTracking.token) {
@@ -945,18 +931,14 @@ router.post("/:id/public-tracking", requireAny(isAdmin), async (req, res) => {
 });
 
 /* ===== QR SVG ===== */
-router.get("/:id/public-qr.svg", requireAny(isAdmin), async (req, res) => {
+router.get("/:id/public-qr.svg", requireAny(isAdminPerm), async (req, res) => {
   const r = await Repair.findById(req.params.id)
     .select("publicTracking repairId deviceType")
     .lean();
   if (!r || !r.publicTracking?.token) return res.status(404).end();
   const url = `${baseUrl(req)}/t/${r.publicTracking.token}`;
   res.setHeader("Content-Type", "image/svgxml");
-  const svg = await QRCode.toString(url, {
-    type: "svg",
-    margin: 1,
-    width: 256,
-  });
+  const svg = await QRCode.toString(url, { type: "svg", margin: 1, width: 256 });
   res.send(svg);
 });
 

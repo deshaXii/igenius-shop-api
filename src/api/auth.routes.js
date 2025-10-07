@@ -1,135 +1,98 @@
-// src/api/auth.routes.js
+// src/routes/auth.routes.js
 "use strict";
 
-const express = require("express");
-const router = express.Router();
+const router = require("express").Router();
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
-const mongoose = require("mongoose");
 const User = require("../models/User.model");
 
-// helper: توليد توكن
-function signToken(user) {
-  const payload = { id: user._id, role: user.role };
-  const secret = process.env.JWT_SECRET || "dev_secret_change_me";
-  const expiresIn = process.env.JWT_EXPIRES_IN || "1d";
-  return jwt.sign(payload, secret, { expiresIn });
+/* نفس مفاتيح/تطبيع الصلاحيات المستخدمة بالمشروع */
+const PERM_KEYS = [
+  "accessAccounts",
+  "addRepair",
+  "editRepair",
+  "deleteRepair",
+  "receiveDevice",
+  "settings",
+  "adminOverride",
+];
+const toBool = (v) =>
+  v === true || v === 1 || v === "1" || v === "true" || v === "on" || v === "yes";
+
+function normalizePerms(doc) {
+  const src = (doc && (doc.permissions || doc.perms || doc)) || {};
+  const out = {};
+  for (const k of PERM_KEYS) out[k] = toBool(src[k] ?? false);
+
+  if (out.addRepair || out.receiveDevice) {
+    out.addRepair = true;
+    out.receiveDevice = true;
+  }
+  if (out.adminOverride) {
+    for (const k of PERM_KEYS) out[k] = true;
+  }
+  return out;
 }
 
-// sanitize
-function toSafeUser(u) {
-  const obj = u.toObject ? u.toObject() : u;
-  delete obj.password;
-  delete obj.passwordHash;
-  return obj;
-}
-
-/**
- * POST /api/auth/login
- * يقبل identifier (email/username/phone) + password
- * أو يقبل { email,password } / { username,password } / { phone,password }
- */
+/* POST /api/auth/login */
 router.post("/login", async (req, res) => {
   try {
-    if (mongoose.connection.readyState !== 1) {
-      return res
-        .status(503)
-        .json({ message: "Database not connected. Try again shortly." });
+    const rawUser = String(req.body.username || "").trim();
+    const rawPass = String(req.body.password || "");
+
+    if (!rawUser || !rawPass) {
+      return res.status(400).json({ message: "الرجاء إدخال اسم المستخدم وكلمة المرور" });
     }
 
-    const { identifier, email, username, phone, password } = req.body || {};
-
-    const id = String(identifier || email || username || phone || "").trim();
-    if (!id || !password) {
-      return res.status(400).json({
-        message: "identifier/email/username/phone and password are required",
-      });
-    }
-
-    const query = {
-      $or: [{ email: id.toLowerCase() }, { username: id }, { phone: id }],
+    // اسم مستخدم أو بريد—ابحث بأي منهم (case-insensitive)
+    const q = {
+      $or: [
+        { username: rawUser },
+        { email: rawUser.toLowerCase() },
+      ],
     };
 
-    // لو password مخفي في السكيما بـ select: false، نجبر إظهاره
-    let user = await User.findOne(query).select("+password +passwordHash");
+    // لو في احتمال اختلاف case لأسماء المستخدمين، نقدر نستخدم regex:
+    // const q = { $or: [{ username: new RegExp(`^${rawUser}$`, "i") }, { email: rawUser.toLowerCase() }] };
+
+    const user = await User.findOne(q)
+      .select("name username email role password permissions perms isSeedAdmin department")
+      .lean();
+
     if (!user) {
-      return res.status(401).json({ message: "Invalid credentials" });
+      return res.status(401).json({ message: "بيانات الدخول غير صحيحة" });
     }
 
-    // مقارنة الباسورد: ادعم comparePassword أو bcrypt مباشرة
-    let ok = false;
-    if (typeof user.comparePassword === "function") {
-      ok = await user.comparePassword(password);
-    } else if (user.password) {
-      ok = await bcrypt.compare(password, user.password);
-    } else if (user.passwordHash) {
-      ok = await bcrypt.compare(password, user.passwordHash);
-    }
-
+    // قارن الباسورد المدخلة بالهاش المخزون
+    const ok = await bcrypt.compare(rawPass, user.password);
     if (!ok) {
-      return res.status(401).json({ message: "Invalid credentials" });
+      return res.status(401).json({ message: "بيانات الدخول غير صحيحة" });
     }
 
-    const token = signToken(user);
-    const safeUser = toSafeUser(user);
-
-    // لو عندك كوكيات JWT:
-    if (String(process.env.AUTH_COOKIE || "").toLowerCase() === "true") {
-      res.cookie("token", token, {
-        httpOnly: true,
-        sameSite: "lax",
-        secure: !!process.env.COOKIE_SECURE,
-        maxAge: 24 * 60 * 60 * 1000,
-      });
-    }
-
-    return res.json({ token, user: safeUser });
-  } catch (e) {
-    console.error("Login error:", e);
-    return res.status(500).json({ message: "Server error" });
-  }
-});
-
-/**
- * (اختياري) إنشاء مستخدم — مفيد لو عايز تضيف فنيين من الباك إند
- * يفضل تحميه بصلاحيات لاحقًا
- */
-router.post("/register", async (req, res) => {
-  try {
-    const { name, email, username, phone, password, role, permissions } =
-      req.body || {};
-    if (!password || !(email || username || phone)) {
-      return res.status(400).json({ message: "Missing fields" });
-    }
-
-    const exists = await User.findOne({
-      $or: [{ email }, { username }, { phone }],
-    });
-    if (exists) return res.status(409).json({ message: "User already exists" });
-
-    const user = new User({
-      name: name || username || email || phone,
-      email: email ? String(email).toLowerCase() : undefined,
-      username,
-      phone,
-      role: role || "technician",
-      permissions: permissions || {},
-      password, // نعتمد على pre-save hook لو موجود، وإلا نحاول bcrypt في الأسفل
+    // جهّز التوكن + المستخدم للواجهة
+    const tokenPayload = { id: String(user._id) };
+    const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "dev_secret_change_me", {
+      expiresIn: process.env.JWT_EXPIRES_IN || "7d",
     });
 
-    // لو السكيما ما عندهاش pre-save hash، اعمل هاش يدوي:
-    if (!user.isModified || !user.isModified("password")) {
-      // السكيما قد لا تملك isModified، فنضيف حماية:
-      if (!user.passwordHash && !user.password?.startsWith("$2")) {
-        user.password = await bcrypt.hash(String(password), 10);
-      }
-    }
+    const perms = normalizePerms(user);
 
-    await user.save();
-    return res.status(201).json(toSafeUser(user));
+    return res.json({
+      token,
+      user: {
+        id: String(user._id),
+        name: user.name,
+        username: user.username,
+        email: user.email,
+        role: user.role,
+        department: user.department || null,
+        isSeedAdmin: !!user.isSeedAdmin,
+        permissions: perms,
+      },
+    });
   } catch (e) {
-    console.error("Register error:", e);
-    return res.status(500).json({ message: "Server error" });
+    console.error("login error:", e);
+    return res.status(500).json({ message: "تعذر تسجيل الدخول" });
   }
 });
 
