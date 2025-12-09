@@ -12,10 +12,17 @@ function toPublicView(doc) {
   const showEta = pt.showEta !== false;
 
   const timeline = [];
-  if (r.createdAt) timeline.push({ key: "createdAt", label: "تم الاستلام", at: r.createdAt });
-  if (r.startTime) timeline.push({ key: "start", label: "بدأ العمل", at: r.startTime });
+  if (r.createdAt)
+    timeline.push({ key: "createdAt", label: "تم الاستلام", at: r.createdAt });
+  if (r.startTime)
+    timeline.push({ key: "start", label: "بدأ العمل", at: r.startTime });
   if (r.endTime) timeline.push({ key: "end", label: "اكتملت", at: r.endTime });
-  if (r.deliveryDate) timeline.push({ key: "delivered", label: "تم التسليم", at: r.deliveryDate });
+  if (r.deliveryDate)
+    timeline.push({
+      key: "delivered",
+      label: "تم التسليم",
+      at: r.deliveryDate,
+    });
 
   return {
     id: r._id,
@@ -77,6 +84,47 @@ router.get("/repairs/:token", async (req, res) => {
       workingHours: r.shopWorkingHours,
     },
   });
+});
+
+router.post("/repairs/:token/feedback", async (req, res, next) => {
+  try {
+    const { token } = req.params;
+    const { rating, note } = req.body;
+
+    // نفس الفيلد اللي بتستخدمه في GET /public/repairs/:token
+    // عدّله لو عندك اسم مختلف (مثلاً trackingToken بدل publicToken)
+    const repair = await Repair.findOne({ publicToken: token });
+    if (!repair) {
+      return res.status(404).json({ message: "طلب الصيانة غير موجود" });
+    }
+
+    const numRating = Number(rating);
+    const cleanRating = Number.isFinite(numRating)
+      ? Math.max(1, Math.min(5, numRating))
+      : 0;
+    const cleanNote = (note || "").toString().trim().slice(0, 1000);
+
+    if (!cleanRating && !cleanNote) {
+      return res
+        .status(400)
+        .json({ message: "لا يوجد بيانات للتقييم لإرسالها" });
+    }
+
+    repair.customerFeedback = {
+      rating: cleanRating || undefined,
+      note: cleanNote || undefined,
+      createdAt: new Date(),
+    };
+
+    await repair.save();
+
+    return res.json({
+      success: true,
+      feedback: repair.customerFeedback,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;

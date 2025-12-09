@@ -20,7 +20,12 @@ const PERM_KEYS = [
 ];
 
 const toBool = (v) =>
-  v === true || v === 1 || v === "1" || v === "true" || v === "on" || v === "yes";
+  v === true ||
+  v === 1 ||
+  v === "1" ||
+  v === "true" ||
+  v === "on" ||
+  v === "yes";
 
 function normalizePerms(doc) {
   const src = (doc && (doc.permissions || doc.perms || doc)) || {};
@@ -49,7 +54,9 @@ async function getAuthContext(req) {
   const perms = normalizePerms(dbUser || base || {});
   const isAdmin =
     !!dbUser &&
-    (dbUser.role === "admin" || perms.adminOverride === true || base.isAdmin === true);
+    (dbUser.role === "admin" ||
+      perms.adminOverride === true ||
+      base.isAdmin === true);
 
   const hasIntake = perms.addRepair || perms.receiveDevice;
 
@@ -74,7 +81,9 @@ router.get("/", async (req, res, next) => {
 
     let query = {};
     if (!(isAdmin || hasIntake)) {
-      const mine = await Department.findOne({ monitor: dbUser?._id }).select("_id");
+      const mine = await Department.findOne({ monitor: dbUser?._id }).select(
+        "_id"
+      );
       if (!mine) return res.json([]);
       query = { _id: mine._id };
     }
@@ -108,9 +117,13 @@ router.post("/", async (req, res, next) => {
     if (!isAdmin) return res.status(403).json({ error: "Forbidden" });
 
     const { name, description } = req.body;
-    const created = await Department.create({ name, description });
+    const created = await Department.create({
+      name,
+      description,
+    });
     res.status(201).json(created);
   } catch (e) {
+    console.log(e);
     next(e);
   }
 });
@@ -251,6 +264,47 @@ router.get("/:id/technicians", async (req, res, next) => {
       .select("name username email phone department")
       .lean();
     res.json(techs);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// DELETE /api/departments/:id/technicians/:techId
+// admin أو مراقب هذا القسم
+router.delete("/:id/technicians/:techId", async (req, res, next) => {
+  try {
+    const { isAdmin, dbUser } = await getAuthContext(req);
+
+    if (!isAdmin) {
+      const ok = await isMonitorOf(dbUser?._id, req.params.id);
+      if (!ok) return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const depId = req.params.id;
+    const techId = req.params.techId;
+
+    const tech = await Technician.findById(techId).select("department");
+    if (!tech) {
+      return res.status(404).json({ error: "TECH_NOT_FOUND" });
+    }
+
+    if (!tech.department || String(tech.department) !== String(depId)) {
+      return res.status(400).json({
+        error: "NOT_IN_DEPARTMENT",
+        message: "هذا الفنّي ليس ضمن هذا القسم",
+      });
+    }
+
+    // لو كان هو المراقب الحالي للقسم، احذف المراقب
+    await Department.updateOne(
+      { _id: depId, monitor: techId },
+      { $set: { monitor: null } }
+    );
+
+    tech.department = null;
+    await tech.save();
+
+    res.json({ ok: true });
   } catch (e) {
     next(e);
   }

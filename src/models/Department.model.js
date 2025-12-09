@@ -9,7 +9,13 @@ const DepartmentSchema = new mongoose.Schema(
     monitor: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
+      required: false,
       default: null,
+    },
+    supervisor: {
+      type: /* ObjectId */ mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: false,
     },
   },
   { timestamps: true }

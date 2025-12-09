@@ -17,7 +17,12 @@ const PERM_KEYS = [
 
 /* تحويل أي قيمة إلى Boolean مضبوط */
 const toBool = (v) =>
-  v === true || v === 1 || v === "1" || v === "true" || v === "on" || v === "yes";
+  v === true ||
+  v === 1 ||
+  v === "1" ||
+  v === "true" ||
+  v === "on" ||
+  v === "yes";
 
 /* تطبيع الصلاحيات من (permissions | perms) + تفعيل شامل لو adminOverride */
 function normalizePerms(doc) {
@@ -62,7 +67,9 @@ module.exports = async function requireAuth(req, res, next) {
 
     // هات المستخدم كامل (بما فيها perms/permissions/isSeedAdmin/department)
     const user = await User.findById(uid)
-      .select("role permissions perms isSeedAdmin department name username email")
+      .select(
+        "role permissions perms isSeedAdmin department name username email"
+      )
       .lean();
 
     if (!user) return res.status(401).json({ message: "User not found" });
@@ -87,7 +94,10 @@ module.exports = async function requireAuth(req, res, next) {
       username: user.username,
       email: user.email,
       permissions: perms,
-      isAdmin: user.role === "admin" || user.isSeedAdmin === true || perms.adminOverride === true,
+      isAdmin:
+        user.role === "admin" ||
+        user.isSeedAdmin === true ||
+        perms.adminOverride === true,
     };
 
     next();

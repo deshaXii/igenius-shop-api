@@ -140,6 +140,11 @@ const RepairSchema = new mongoose.Schema(
     warrantyEnd: { type: Date, default: null },
     warrantyNotes: { type: String, trim: true, default: "" },
 
+    customerFeedback: {
+      rating: { type: Number, min: 1, max: 5 },
+      note: { type: String, trim: true },
+      createdAt: { type: Date },
+    },
     // Updates for public tracking
     customerUpdates: {
       type: [
