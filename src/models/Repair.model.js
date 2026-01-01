@@ -51,7 +51,7 @@ const PublicTrackingSchema = new mongoose.Schema(
   {
     enabled: { type: Boolean, default: true },
     token: { type: String, unique: true, sparse: true, index: true },
-    showPrice: { type: Boolean, default: false },
+    showPrice: { type: Boolean, default: true },
     showEta: { type: Boolean, default: true },
     createdAt: { type: Date, default: Date.now },
     lastViewedAt: Date,
@@ -124,14 +124,7 @@ const RepairSchema = new mongoose.Schema(
 
     status: {
       type: String,
-      enum: [
-        "في الانتظار",
-        "جاري العمل",
-        "مكتمل",
-        "تم التسليم",
-        "مرفوض",
-        "مرتجع",
-      ],
+      enum: ["في الانتظار", "جاري العمل", "مكتمل", "تم التسليم", "مرفوض", "مرتجع"],
       default: "في الانتظار",
     },
 
@@ -145,6 +138,7 @@ const RepairSchema = new mongoose.Schema(
       note: { type: String, trim: true },
       createdAt: { type: Date },
     },
+
     // Updates for public tracking
     customerUpdates: {
       type: [
@@ -231,10 +225,8 @@ RepairSchema.index({ currentDepartment: 1, updatedAt: -1 });
 RepairSchema.index({ "flows.department": 1, "flows.status": 1 });
 RepairSchema.index({ createdAt: 1 });
 RepairSchema.index({ deliveryDate: 1 });
-RepairSchema.index(
-  { "publicTracking.token": 1 },
-  { unique: true, sparse: true }
-);
+RepairSchema.index({ returnDate: 1 }); // ✅ مهم لعرض "مرتجع" في اليوم
+RepairSchema.index({ "publicTracking.token": 1 }, { unique: true, sparse: true });
 
 /* ===== Derive department from technician if missing ===== */
 RepairSchema.pre("save", async function (next) {
@@ -286,5 +278,4 @@ async function dropOldPartsIdIndexIfExists() {
 }
 dropOldPartsIdIndexIfExists();
 
-module.exports =
-  mongoose.models.Repair || mongoose.model("Repair", RepairSchema);
+module.exports = mongoose.models.Repair || mongoose.model("Repair", RepairSchema);

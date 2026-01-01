@@ -4,27 +4,52 @@
 const express = require("express");
 const router = express.Router();
 const Settings = require("../models/Settings.model");
-const User = require("../models/User.model");
 const QRCode = require("qrcode");
+const crypto = require("crypto");
 
-// ✅ خليك متسق مع بقية المشروع
 const requireAuth = require("../middleware/requireAuth");
 
-// لو حابب تسيب checkPermission موجود، ماشي
-// بس هنا هنعمل ضمانة أوضح للوصول
-// const checkPermission = require("../middleware/checkPermission");
-
-/* ----------------- Middleware ----------------- */
 router.use(requireAuth);
 
 // إذن الوصول للإعدادات: admin | adminOverride | accessAccounts
 function ensureSettingsAccess(req, res, next) {
   const u = req.user || {};
-  const p = (u.permissions || {});
+  const p = u.permissions || {};
   if (u.role === "admin" || p.adminOverride === true || p.accessAccounts === true) {
     return next();
   }
   return res.status(403).json({ error: "Forbidden" });
+}
+
+/* ---------- Subscription Passcode (ENV) ---------- */
+const SUB_PASS = String(process.env.SUBSCRIPTION_ADMIN_PASSCODE || "");
+const SUB_PASS_HASH = SUB_PASS
+  ? crypto.createHash("sha256").update(SUB_PASS, "utf8").digest()
+  : null;
+
+function ensureSubscriptionPasscode(req, res, next) {
+  if (!SUB_PASS_HASH) {
+    return res.status(500).json({ message: "SUBSCRIPTION_PASSCODE_NOT_CONFIGURED" });
+  }
+
+  const provided =
+    String(req.get("x-subscription-passcode") || "").trim() ||
+    String(req.body?.passcode || "").trim();
+
+  if (!provided) {
+    return res.status(401).json({ message: "SUBSCRIPTION_PASSCODE_REQUIRED" });
+  }
+
+  const providedHash = crypto.createHash("sha256").update(provided, "utf8").digest();
+
+  // timing safe compare
+  const ok =
+    providedHash.length === SUB_PASS_HASH.length &&
+    crypto.timingSafeEqual(providedHash, SUB_PASS_HASH);
+
+  if (!ok) return res.status(403).json({ message: "INVALID_SUBSCRIPTION_PASSCODE" });
+
+  return next();
 }
 
 /* ---------- Helpers ---------- */
@@ -32,9 +57,31 @@ async function getSettingsDoc() {
   let s = await Settings.findOne();
   if (!s) {
     s = new Settings();
-    await s.save();
   }
+
+  // ✅ Default: يبدأ من الغد لمدة سنة لو مش متسجل
+  if (!s.subscription || !s.subscription.startAt || !s.subscription.endAt) {
+    const now = new Date();
+    const tomorrow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+    const end = new Date(tomorrow);
+    end.setUTCFullYear(end.getUTCFullYear() + 1);
+
+    s.subscription = {
+      planName: s.subscription?.planName || "Yearly",
+      startAt: s.subscription?.startAt || tomorrow,
+      endAt: s.subscription?.endAt || end,
+      cycle: "yearly",
+    };
+  }
+
+  await s.save();
   return s;
+}
+
+function parseDateOrNull(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isFinite(d.getTime()) ? d : null;
 }
 
 /* ---------- GET settings ---------- */
@@ -48,6 +95,13 @@ router.get("/", ensureSettingsAccess, async (req, res) => {
     receiptFontSizePt: s.receiptFontSizePt,
     receiptPaperWidthMm: s.receiptPaperWidthMm,
     receiptMarginMm: s.receiptMarginMm,
+
+    subscription: {
+      planName: s.subscription?.planName || "Yearly",
+      startAt: s.subscription?.startAt || null,
+      endAt: s.subscription?.endAt || null,
+      cycle: s.subscription?.cycle || "yearly",
+    },
   });
 });
 
@@ -126,15 +180,41 @@ router.put("/receipt", ensureSettingsAccess, async (req, res) => {
   });
 });
 
+/* ---------- ✅ Update subscription (Protected by ENV passcode) ---------- */
+router.put(
+  "/subscription",
+  ensureSettingsAccess,
+  ensureSubscriptionPasscode,
+  async (req, res) => {
+    const s = await getSettingsDoc();
+
+    const planName = String(req.body.planName || "Yearly").trim() || "Yearly";
+    const startAt = parseDateOrNull(req.body.startAt);
+    const endAt = parseDateOrNull(req.body.endAt);
+
+    if (!startAt || !endAt) {
+      return res.status(400).json({ message: "startAt and endAt are required" });
+    }
+    if (endAt.getTime() <= startAt.getTime()) {
+      return res.status(400).json({ message: "endAt must be after startAt" });
+    }
+
+    s.subscription = { planName, startAt, endAt, cycle: "yearly" };
+    await s.save();
+
+    return res.json({
+      ok: true,
+      subscription: {
+        planName: s.subscription.planName,
+        startAt: s.subscription.startAt,
+        endAt: s.subscription.endAt,
+        cycle: s.subscription.cycle,
+      },
+    });
+  }
+);
+
 /* ---------- Social QR (SVG) ---------- */
-/**
- * ملحوظة مهمة:
- * الاندبوينت ده بيرجع صورة SVG، وأغلب المشاريع عاملة Interceptor
- * يعمل Log out عند أي 401. عشان نتجنّب خروج المستخدم لو الصورة فشلت،
- * هنسمح بالـ token من الكويري `?token=` برضه (auth middleware بتاعك بيدعمه).
- *
- * وكمان نمرره بنفس ensureSettingsAccess عشان مايبقاش مفتوح.
- */
 router.get("/social/:idx/qr.svg", ensureSettingsAccess, async (req, res) => {
   const idx = Number(req.params.idx);
   const s = await getSettingsDoc();

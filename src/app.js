@@ -70,6 +70,7 @@ app.use("/api/backup", require("./api/backup.routes"));
 app.use("/api/logs", require("./api/logs.routes"));
 app.use("/api/public", require("./api/public.routes"));
 app.use("/api/settings", require("./api/settings.routes"));
+app.use("/api/chat", require("./api/chat.routes"));
 app.use("/api/departments", require("./api/departments.routes"));
 app.use("/api/suppliers", require("./api/suppliers.routes"));
 app.use("/api/inventory", require("./api/inventory.routes"));

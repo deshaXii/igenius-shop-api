@@ -3,18 +3,29 @@
 const express = require("express");
 const auth = require("../middleware/auth.js");
 const checkAdmin = require("../middleware/checkAdmin.js");
-const { backupToBuffer } = require("../backup/backupService");
+const path = require("path");
+const fs = require("fs");
+
+const multer = require("multer");
 
 const {
+  backupToBuffer,
   runBackupNow,
   readLastMeta,
   getDbStats,
   BACKUP_DIR,
-} = require("../backup/backupService");
-const path = require("path");
-const fs = require("fs");
+  restoreFromBackupBuffer,
+} = require("../backup/backupService.js");
 
 const router = express.Router();
+
+// Upload in-memory (ملف صغير)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: Number(process.env.BACKUP_MAX_UPLOAD_MB || 50) * 1024 * 1024,
+  },
+});
 
 router.post("/run-download", auth, checkAdmin, async (req, res) => {
   try {
@@ -27,6 +38,34 @@ router.post("/run-download", auth, checkAdmin, async (req, res) => {
     res.status(500).json({ message: "فشل في إنشاء/تنزيل النسخة الاحتياطية" });
   }
 });
+
+// Restore: ارفع ملف backup واسترجعه
+router.post(
+  "/restore",
+  auth,
+  checkAdmin,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ message: "اختر ملف النسخة الاحتياطية" });
+      }
+
+      const replace =
+        String(req.body?.replace || "1") === "1" ||
+        String(req.body?.replace || "").toLowerCase() === "true";
+
+      const r = await restoreFromBackupBuffer(req.file.buffer, req.file.originalname, {
+        replace,
+      });
+
+      res.json(r);
+    } catch (e) {
+      console.error("[backup/restore] error:", e);
+      res.status(500).json({ message: "فشل استعادة النسخة الاحتياطية" });
+    }
+  }
+);
 
 // تشغيل النسخ الآن:
 // 1) إداري Auth + Admin
@@ -46,7 +85,6 @@ router.all(
           .json({ message: "فشل في أخذ النسخة الاحتياطية" });
       }
     }
-    // لو مفيش سيكرت → رجّع للـ auth العادي
     return next();
   },
   auth,
@@ -94,16 +132,17 @@ router.get("/stats", auth, checkAdmin, async (req, res) => {
 });
 
 // تنزيل ملف محلي (لو بتشتغل على لوكل فقط)
-// على Vercel غالبًا مش هيبقى فيه ملف محلي دائم
 router.get("/download/:file", auth, checkAdmin, (req, res) => {
   const file = req.params.file;
   if (!/^[\w.\-]+$/.test(file))
     return res.status(400).json({ message: "اسم ملف غير صالح" });
+
   const full = path.join(BACKUP_DIR, file);
   if (!fs.existsSync(full))
     return res
       .status(404)
       .json({ message: "الملف غير موجود (قد يكون رُفع للتخزين الخارجي)" });
+
   res.setHeader("Content-Disposition", `attachment; filename="${file}"`);
   res.setHeader("Content-Type", "application/octet-stream");
   fs.createReadStream(full).pipe(res);

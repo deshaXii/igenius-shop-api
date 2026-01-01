@@ -47,9 +47,9 @@ function normalizePerms(doc) {
 // نجيب المستخدم كامل من الداتا ونبني كونتكست صلاحيات موثوق
 async function getAuthContext(req) {
   const base = req.user || {};
-  const dbUser = await User.findById(base._id)
-    .select("role permissions perms isSeedAdmin")
-    .lean();
+  const dbUser = await User.findById(base._id || base.id)
+  .select("role permissions perms isSeedAdmin department")
+  .lean();
 
   const perms = normalizePerms(dbUser || base || {});
   const isAdmin =
@@ -152,16 +152,43 @@ router.delete("/:id", async (req, res, next) => {
     const { isAdmin } = await getAuthContext(req);
     if (!isAdmin) return res.status(403).json({ error: "Forbidden" });
 
-    await Department.findByIdAndDelete(req.params.id);
+    const depId = req.params.id;
+    if (!mongoose.Types.ObjectId.isValid(depId)) {
+      return res.status(400).json({ error: "InvalidId" });
+    }
+
+    const depObjId = new mongoose.Types.ObjectId(depId);
+
+    // ✅ امنع الحذف لو القسم مستخدم في أي صيانة (currentDepartment / department / flows.department)
+    const inUse = await Repair.countDocuments({
+      $or: [
+        { currentDepartment: depObjId },
+        { department: depObjId },
+        { "flows.department": depObjId },
+      ],
+    });
+
+    if (inUse > 0) {
+      return res.status(409).json({
+        error: "DEPARTMENT_IN_USE",
+        message: `لا يمكن حذف القسم لأنه مرتبط بـ ${inUse} صيانة. انقل الصيانات لقسم آخر أولاً ثم احذف.`,
+      });
+    }
+
+    await Department.findByIdAndDelete(depId);
+
+    // بما أنه غير مستخدم، نفك الفنيين منه (احتياطيًا)
     await Technician.updateMany(
-      { department: req.params.id },
+      { department: depId },
       { $set: { department: null } }
     );
+
     res.json({ ok: true });
   } catch (e) {
     next(e);
   }
 });
+
 
 // GET /api/departments/:id/repair-stats
 // admin أو hasIntake أو monitor لهذا القسم
